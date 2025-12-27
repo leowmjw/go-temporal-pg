@@ -1,0 +1,201 @@
+version: '3.8'
+
+services:
+  # PostgreSQL instances for testing
+  postgres-source:
+    image: postgres:14.9
+    environment:
+      POSTGRES_DB: testdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: testpass
+      POSTGRES_INITDB_ARGS: "--auth-host=md5"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_source_data:/var/lib/postgresql/data
+      - ./test/sql/init-source.sql:/docker-entrypoint-initdb.d/init.sql
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_replication_slots=10
+      -c max_logical_replication_workers=10
+      -c shared_preload_libraries='pgactive'
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  postgres-target:
+    image: postgres:15.4
+    environment:
+      POSTGRES_DB: testdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: testpass
+      POSTGRES_INITDB_ARGS: "--auth-host=md5"
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_target_data:/var/lib/postgresql/data
+      - ./test/sql/init-target.sql:/docker-entrypoint-initdb.d/init.sql
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_replication_slots=10
+      -c max_logical_replication_workers=10
+      -c shared_preload_libraries='pgactive'
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Temporal development server
+  temporal:
+    image: temporalio/auto-setup:1.25.0
+    ports:
+      - "7233:7233"    # Temporal gRPC
+      - "8233:8233"    # Temporal Web UI
+    environment:
+      - DB=postgresql
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - POSTGRES_SEEDS=postgres-temporal
+      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
+    depends_on:
+      postgres-temporal:
+        condition: service_healthy
+    volumes:
+      - ./test/temporal/config:/etc/temporal/config/dynamicconfig
+    healthcheck:
+      test: ["CMD", "tctl", "--address", "temporal:7233", "cluster", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # PostgreSQL for Temporal
+  postgres-temporal:
+    image: postgres:13
+    environment:
+      POSTGRES_DB: temporal
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_temporal_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # LocalStack for AWS service mocking
+  localstack:
+    image: localstack/localstack:3.8
+    ports:
+      - "4566:4566"    # LocalStack edge port
+    environment:
+      - SERVICES=rds,secretsmanager,iam
+      - DEBUG=1
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - DEFAULT_REGION=us-east-1
+    volumes:
+      - "./test/localstack:/etc/localstack/init/ready.d"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Application under test
+  pgactive-upgrade:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    environment:
+      - TEMPORAL_HOST=temporal:7233
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-east-1
+      - SOURCE_DB_HOST=postgres-source
+      - TARGET_DB_HOST=postgres-target
+      - LOG_LEVEL=debug
+    depends_on:
+      temporal:
+        condition: service_healthy
+      postgres-source:
+        condition: service_healthy
+      postgres-target:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    volumes:
+      - ./test/config:/app/config
+    command: ["./test/e2e/run-tests.sh"]
+
+  # Test data generator
+  test-data-generator:
+    build:
+      context: .
+      dockerfile: test/Dockerfile.datagen
+    environment:
+      - SOURCE_DB_HOST=postgres-source
+      - SOURCE_DB_PORT=5432
+      - SOURCE_DB_USER=postgres
+      - SOURCE_DB_PASS=testpass
+      - SOURCE_DB_NAME=testdb
+    depends_on:
+      postgres-source:
+        condition: service_healthy
+    volumes:
+      - ./test/data:/app/data
+    command: ["./generate-test-data.sh"]
+
+  # Monitoring and observability
+  prometheus:
+    image: prom/prometheus:v2.40.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./test/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+
+  grafana:
+    image: grafana/grafana:9.3.0
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - ./test/grafana/provisioning:/etc/grafana/provisioning
+      - ./test/grafana/dashboards:/var/lib/grafana/dashboards
+      - grafana_data:/var/lib/grafana
+
+  # Jaeger for distributed tracing
+  jaeger:
+    image: jaegertracing/all-in-one:1.40
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "14268:14268"  # Jaeger collector
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+
+volumes:
+  postgres_source_data:
+  postgres_target_data:
+  postgres_temporal_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  default:
+    driver: bridge

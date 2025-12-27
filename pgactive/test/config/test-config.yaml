@@ -1,0 +1,148 @@
+---
+# Test configuration for pgactive upgrade system
+
+# Temporal configuration
+temporal:
+  host: temporal:7233
+  namespace: default
+  task_queue: pgactive-upgrade
+
+# AWS configuration (using LocalStack)
+aws:
+  region: us-east-1
+  endpoint_url: http://localstack:4566
+  access_key_id: test
+  secret_access_key: test
+
+# Database configuration
+databases:
+  source:
+    host: postgres-source
+    port: 5432
+    username: postgres
+    password: testpass
+    database: testdb
+    ssl_mode: disable
+  
+  target:
+    host: postgres-target
+    port: 5433
+    username: postgres
+    password: testpass
+    database: testdb
+    ssl_mode: disable
+
+# Test scenarios configuration
+test_scenarios:
+  happy_path:
+    source_db_instance_id: test-source-db
+    target_version: "15.4"
+    shift_percentages: [25, 25, 50]
+    instance_class: db.r6g.large
+    backup_retention_days: 7
+    
+  rollback_test:
+    source_db_instance_id: test-rollback-db
+    target_version: "15.4"
+    shift_percentages: [50, 50]
+    trigger_rollback_after_phase: 1
+    
+  health_check_failure:
+    source_db_instance_id: test-health-fail-db
+    target_version: "15.4"
+    shift_percentages: [100]
+    simulate_health_check_failure: true
+    
+  concurrent_upgrades:
+    count: 3
+    source_db_prefix: concurrent-source
+    target_version: "15.4"
+    shift_percentages: [100]
+    
+  large_dataset:
+    source_db_instance_id: test-large-dataset-db
+    target_version: "15.4"
+    shift_percentages: [10, 20, 30, 40]
+    dataset_size: large
+    simulate_high_load: true
+
+# Logging configuration
+logging:
+  level: debug
+  format: json
+  output: stdout
+
+# Observability configuration
+observability:
+  metrics:
+    enabled: true
+    endpoint: http://prometheus:9090
+  
+  tracing:
+    enabled: true
+    endpoint: http://jaeger:14268/api/traces
+    service_name: pgactive-upgrade
+  
+  health_check:
+    enabled: true
+    port: 8080
+    path: /health
+
+# Test data configuration
+test_data:
+  users_count: 1000
+  orders_count: 5000
+  products_count: 100
+  order_items_count: 10000
+  
+  # Data generation settings
+  generate_large_dataset: false
+  simulate_concurrent_writes: false
+  write_operations_per_second: 10
+
+# Timeout configuration
+timeouts:
+  workflow_execution: 1800s  # 30 minutes
+  activity_start_to_close: 900s  # 15 minutes
+  activity_heartbeat: 300s  # 5 minutes
+  health_check: 30s
+  rollback_execution: 600s  # 10 minutes
+
+# Retry configuration
+retries:
+  max_attempts: 3
+  initial_interval: 1s
+  backoff_coefficient: 2.0
+  maximum_interval: 60s
+
+# Validation rules
+validation:
+  required_extensions:
+    - pgactive
+    - pgcrypto
+  
+  required_parameters:
+    wal_level: logical
+    max_replication_slots: 10
+    max_logical_replication_workers: 10
+  
+  min_postgres_version: "14.0"
+  supported_target_versions:
+    - "15.4"
+    - "15.5"
+    - "16.0"
+    - "16.1"
+
+# Security configuration
+security:
+  encryption:
+    at_rest: true
+    in_transit: true
+  
+  authentication:
+    method: iam
+    require_ssl: false  # Disabled for testing
+  
+  secrets:
+    provider: aws_secrets_manager
+    region: us-east-1

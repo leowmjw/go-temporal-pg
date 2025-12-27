@@ -1,0 +1,90 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+scrape_configs:
+  # The job name is added as a label `job=<job_name>` to any timeseries scraped from this config.
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # pgactive-upgrade service metrics
+  - job_name: 'pgactive-upgrade'
+    static_configs:
+      - targets: ['pgactive-upgrade:8080']
+    scrape_interval: 10s
+    metrics_path: '/metrics'
+    
+  # PostgreSQL source database metrics (using postgres_exporter)
+  - job_name: 'postgres-source'
+    static_configs:
+      - targets: ['postgres-source:9187']
+    scrape_interval: 30s
+    
+  # PostgreSQL target database metrics
+  - job_name: 'postgres-target'
+    static_configs:
+      - targets: ['postgres-target:9187']
+    scrape_interval: 30s
+    
+  # Temporal metrics (if exposed)
+  - job_name: 'temporal'
+    static_configs:
+      - targets: ['temporal:8000']
+    scrape_interval: 30s
+    metrics_path: '/metrics'
+    
+  # LocalStack metrics (if available)
+  - job_name: 'localstack'
+    static_configs:
+      - targets: ['localstack:4566']
+    scrape_interval: 60s
+    metrics_path: '/_localstack/metrics'
+
+# Alerting rules for upgrade monitoring
+rule_files:
+  - "/etc/prometheus/rules/*.yml"
+
+# Example alerting rules (would be in separate files)
+groups:
+  - name: pgactive-upgrade.rules
+    rules:
+      - alert: WorkflowFailureRate
+        expr: rate(workflows_failed_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High workflow failure rate detected"
+          description: "Workflow failure rate is {{ $value }} failures per second"
+          
+      - alert: ReplicationLagHigh
+        expr: replication_lag_bytes > 1073741824  # 1GB
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Replication lag is too high"
+          description: "Replication lag is {{ $value }} bytes ({{ $value | humanize1024 }}B)"
+          
+      - alert: UpgradeStuck
+        expr: changes(upgrade_phase[10m]) == 0 and upgrade_phase > 0 and upgrade_phase < 13
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Upgrade appears to be stuck"
+          description: "Upgrade has been in phase {{ $value }} for more than 10 minutes"
+          
+      - alert: HealthCheckFailing
+        expr: health_check_status == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Health check is failing"
+          description: "Health check {{ $labels.check_type }} is failing for workflow {{ $labels.workflow_id }}"
