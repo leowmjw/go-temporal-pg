@@ -1,0 +1,2 @@
+run:
+	@mise dx
