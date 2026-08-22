@@ -50,7 +50,7 @@ func (s *RealIntegrationTestSuite) SetupSuite() {
 
 	// Start PostgreSQL container for testing
 	pgContainer, err := postgres.RunContainer(ctx,
-		testcontainers.WithImage("postgres:15.4"),
+		testcontainers.WithImage("postgres:18"),
 		postgres.WithDatabase("testdb"),
 		postgres.WithUsername("postgres"),
 		postgres.WithPassword("testpass"),

@@ -1,9 +1,12 @@
-version: '3.8'
+# Compose spec: the top-level `version` key is obsolete and warns on modern
+# Docker Compose (v2+), so it is intentionally omitted.
 
 services:
-  # PostgreSQL instances for testing
+  # PostgreSQL instances for testing.
+  # Source/target are deliberately different majors so the rolling-upgrade
+  # path under test (17 -> 18) is exercised.
   postgres-source:
-    image: postgres:14.9
+    image: postgres:17
     environment:
       POSTGRES_DB: testdb
       POSTGRES_USER: postgres
@@ -14,12 +17,15 @@ services:
     volumes:
       - postgres_source_data:/var/lib/postgresql/data
       - ./test/sql/init-source.sql:/docker-entrypoint-initdb.d/init.sql
+    # NOTE: `-c shared_preload_libraries='pgactive'` was removed. The stock
+    # postgres image does not ship the pgactive extension, so Postgres exits at
+    # startup ("could not access file \"pgactive\"") and the healthcheck never
+    # passes. Restore it only alongside an image that actually builds pgactive.
     command: >
       postgres
       -c wal_level=logical
       -c max_replication_slots=10
       -c max_logical_replication_workers=10
-      -c shared_preload_libraries='pgactive'
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
@@ -27,7 +33,7 @@ services:
       retries: 5
 
   postgres-target:
-    image: postgres:15.4
+    image: postgres:18
     environment:
       POSTGRES_DB: testdb
       POSTGRES_USER: postgres
@@ -38,12 +44,12 @@ services:
     volumes:
       - postgres_target_data:/var/lib/postgresql/data
       - ./test/sql/init-target.sql:/docker-entrypoint-initdb.d/init.sql
+    # See the note on postgres-source re: shared_preload_libraries='pgactive'.
     command: >
       postgres
       -c wal_level=logical
       -c max_replication_slots=10
       -c max_logical_replication_workers=10
-      -c shared_preload_libraries='pgactive'
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
@@ -53,30 +59,31 @@ services:
   # Temporal development server
   temporal:
     image: temporalio/auto-setup:1.25.0
+    # Note: auto-setup serves gRPC only; the Web UI is a separate
+    # temporalio/ui image, so the old 8233 mapping was a no-op and is dropped.
     ports:
       - "7233:7233"    # Temporal gRPC
-      - "8233:8233"    # Temporal Web UI
     environment:
-      - DB=postgresql
+      - DB=postgres12          # driver name for all modern PostgreSQL servers
       - DB_PORT=5432
       - POSTGRES_USER=temporal
       - POSTGRES_PWD=temporal
       - POSTGRES_SEEDS=postgres-temporal
-      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
     depends_on:
       postgres-temporal:
         condition: service_healthy
-    volumes:
-      - ./test/temporal/config:/etc/temporal/config/dynamicconfig
+    # The ./test/temporal/config dynamic-config mount was removed: that
+    # directory does not exist, and Compose would create it as an empty dir,
+    # masking the image's built-in dynamic config.
     healthcheck:
-      test: ["CMD", "tctl", "--address", "temporal:7233", "cluster", "health"]
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "temporal:7233"]
       interval: 10s
       timeout: 5s
       retries: 5
 
   # PostgreSQL for Temporal
   postgres-temporal:
-    image: postgres:13
+    image: postgres:16
     environment:
       POSTGRES_DB: temporal
       POSTGRES_USER: temporal
@@ -101,8 +108,9 @@ services:
       - DEBUG=1
       - DOCKER_HOST=unix:///var/run/docker.sock
       - DEFAULT_REGION=us-east-1
+    # The ./test/localstack init-hook mount was removed: the directory does not
+    # exist, so Compose would silently create an empty one.
     volumes:
-      - "./test/localstack:/etc/localstack/init/ready.d"
       - "/var/run/docker.sock:/var/run/docker.sock"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
@@ -110,8 +118,15 @@ services:
       timeout: 5s
       retries: 5
 
-  # Application under test
+  # Application under test.
+  #
+  # DISABLED: this service cannot build today. It references Dockerfile.test,
+  # which does not exist; the Dockerfile that does exist builds ./cmd/server and
+  # ./cmd/pgactive-tools and copies a config/ directory, none of which are
+  # present (cmd/ holds only main.go). Re-enable once a working test image
+  # exists. Started explicitly via: docker compose --profile app up
   pgactive-upgrade:
+    profiles: ["app"]
     build:
       context: .
       dockerfile: Dockerfile.test
@@ -137,8 +152,12 @@ services:
       - ./test/config:/app/config
     command: ["./test/e2e/run-tests.sh"]
 
-  # Test data generator
+  # Test data generator.
+  #
+  # DISABLED: test/Dockerfile.datagen does not exist, so `up` fails at build
+  # time. Started explicitly via: docker compose --profile app up
   test-data-generator:
+    profiles: ["app"]
     build:
       context: .
       dockerfile: test/Dockerfile.datagen

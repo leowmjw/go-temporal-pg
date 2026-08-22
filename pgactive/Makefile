@@ -24,7 +24,7 @@ test: test-unit test-integration ## Run all tests
 
 test-unit: ## Run unit tests with coverage
 	@echo "Running unit tests..."
-	go test -v -race -coverprofile=coverage.out ./internal/...
+	~/go/bin/gotest -v -race -coverprofile=coverage.out ./internal/...
 	go tool cover -html=coverage.out -o coverage.html
 
 test-integration: ## Run integration tests (requires Temporal server)
