@@ -1,19 +1,37 @@
-# pgactive Rolling PostgreSQL Upgrade System
+# pgactive Rolling PostgreSQL Upgrade Prototype
 
-A production-ready system for performing rolling major-version upgrades of Amazon RDS for PostgreSQL using **pgactive** orchestrated via **Temporal workflows** in Go 1.24.5.
+An experimental system for orchestrating rolling Amazon RDS for PostgreSQL
+major-version upgrades with **pgactive** and **Temporal workflows** in Go 1.27.
 
 ## Overview
 
-This system automates PostgreSQL major version upgrades with minimal downtime (< 60s), safe rollbacks (< 30s), and comprehensive observability. It uses pgactive for bidirectional logical replication and Temporal for durable workflow orchestration.
+The intended design uses pgactive bidirectional logical replication and
+Temporal durable execution. Several activities are currently simulations, so
+the implementation must not be used to modify production databases.
 
-### Key Features
+### pgactive compatibility
 
-- **Minimal Downtime**: < 60 seconds during cutover
-- **Fast Rollback**: < 30 seconds rollback capability
-- **Idempotent Operations**: Single-command, repeatable execution
-- **Full Observability**: Structured logs, metrics, and distributed tracing
-- **Schema-Level Replication**: Selective table/schema replication support
-- **Comprehensive Testing**: Unit, integration, and end-to-end tests
+As of 2026-08-22, the latest tagged upstream release is
+[pgactive 2.1.8](https://github.com/aws/pgactive/releases/tag/v2.1.8).
+Upstream supports maintained PostgreSQL releases and its 2.1.8 source includes
+compatibility code for PostgreSQL 13 through 19. Confirm the exact pgactive
+version offered by the selected RDS engine release before an upgrade.
+
+pgactive requires `wal_level=logical`, `track_commit_timestamp=on`, and
+`shared_preload_libraries` containing `pgactive`. Operational design must also
+account for its primary-key, sequence, DDL, large-object, collation, conflict,
+and fully-connected-mesh constraints. See the
+[upstream documentation](https://github.com/aws/pgactive/tree/v2.1.8/docs) and
+[Amazon RDS documentation](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Appendix.PostgreSQL.CommonDBATasks.pgactive.html).
+
+### Design goals
+
+- Minimal downtime during cutover
+- A tested rollback path
+- Idempotent, repeatable operations
+- Structured logs, metrics, and distributed tracing
+- Schema-level replication filters
+- Unit, integration, and end-to-end verification
 
 ## Architecture
 
@@ -55,7 +73,7 @@ The `RollingUpgradeWorkflow` orchestrates the following phases:
 
 ### Prerequisites
 
-- Go 1.24.5+
+- [mise](https://mise.jdx.dev/)
 - Docker & Docker Compose
 - AWS CLI configured
 - Temporal CLI (for manual testing)
@@ -63,16 +81,26 @@ The `RollingUpgradeWorkflow` orchestrates the following phases:
 ### Development Setup
 
 ```bash
-# Clone and set up development environment
+# Clone the repository
 git clone <repository>
-cd go-pgactive
-make dev-setup
+cd go-temporal-pg
+
+# Install the pinned Go toolchain
+mise install
+
+# Run source migrations, update modules, and validate
+mise run fix
+mise run tidy
+mise run check
+
+# Start the optional service environment
+make -C pgactive dev-setup
 
 # Run tests
-make test
+make -C pgactive test
 
 # Run end-to-end tests
-make test-e2e
+make -C pgactive test-e2e
 ```
 
 ### Running Locally
@@ -340,4 +368,4 @@ make release-test
 - [AWS Docs: pgactive extension and replication](https://docs.aws.amazon.com/)
 - [PostgreSQL docs: logical replication](https://www.postgresql.org/docs/)
 - [Temporal Go SDK documentation](https://docs.temporal.io/)
-- [Go 1.24 Release Notes](https://golang.org/doc/go1.24)
+- [Go 1.27 Release Notes](https://go.dev/doc/go1.27)

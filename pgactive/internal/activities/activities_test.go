@@ -14,8 +14,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"company.com/infra/pgactive-upgrade/internal/activities/mocks"
-	upgradetypes "company.com/infra/pgactive-upgrade/internal/types"
+	"github.com/leowmjw/go-temporal-pg/pgactive/internal/activities/mocks"
+	upgradetypes "github.com/leowmjw/go-temporal-pg/pgactive/internal/types"
 )
 
 func TestValidateInput(t *testing.T) {
@@ -32,7 +32,7 @@ func TestValidateInput(t *testing.T) {
 				SourceDBInstanceID: "source-db",
 				TargetVersion:      "15.4",
 				ShiftPercentages:   []int{25, 25, 50},
-				Subnets:           []string{"subnet-1", "subnet-2"},
+				Subnets:            []string{"subnet-1", "subnet-2"},
 			},
 			setupMocks: func(mockRDS *mocks.MockRDSClient) {
 				mockRDS.EXPECT().DescribeDBInstances(gomock.Any(), &rds.DescribeDBInstancesInput{
@@ -41,9 +41,9 @@ func TestValidateInput(t *testing.T) {
 					DBInstances: []types.DBInstance{
 						{
 							DBInstanceIdentifier: aws.String("source-db"),
-							Engine:              aws.String("postgres"),
-							EngineVersion:       aws.String("14.9"),
-							DBInstanceStatus:    aws.String("available"),
+							Engine:               aws.String("postgres"),
+							EngineVersion:        aws.String("14.9"),
+							DBInstanceStatus:     aws.String("available"),
 						},
 					},
 				}, nil)
@@ -76,9 +76,9 @@ func TestValidateInput(t *testing.T) {
 					DBInstances: []types.DBInstance{
 						{
 							DBInstanceIdentifier: aws.String("mysql-db"),
-							Engine:              aws.String("mysql"),
-							EngineVersion:       aws.String("8.0"),
-							DBInstanceStatus:    aws.String("available"),
+							Engine:               aws.String("mysql"),
+							EngineVersion:        aws.String("8.0"),
+							DBInstanceStatus:     aws.String("available"),
 						},
 					},
 				}, nil)
@@ -98,9 +98,9 @@ func TestValidateInput(t *testing.T) {
 					DBInstances: []types.DBInstance{
 						{
 							DBInstanceIdentifier: aws.String("source-db"),
-							Engine:              aws.String("postgres"),
-							EngineVersion:       aws.String("14.9"),
-							DBInstanceStatus:    aws.String("available"),
+							Engine:               aws.String("postgres"),
+							EngineVersion:        aws.String("14.9"),
+							DBInstanceStatus:     aws.String("available"),
 						},
 					},
 				}, nil)
@@ -120,9 +120,9 @@ func TestValidateInput(t *testing.T) {
 					DBInstances: []types.DBInstance{
 						{
 							DBInstanceIdentifier: aws.String("source-db"),
-							Engine:              aws.String("postgres"),
-							EngineVersion:       aws.String("14.9"),
-							DBInstanceStatus:    aws.String("available"),
+							Engine:               aws.String("postgres"),
+							EngineVersion:        aws.String("14.9"),
+							DBInstanceStatus:     aws.String("available"),
 						},
 					},
 				}, nil)
@@ -142,9 +142,9 @@ func TestValidateInput(t *testing.T) {
 					DBInstances: []types.DBInstance{
 						{
 							DBInstanceIdentifier: aws.String("source-db"),
-							Engine:              aws.String("postgres"),
-							EngineVersion:       aws.String("14.9"),
-							DBInstanceStatus:    aws.String("backing-up"),
+							Engine:               aws.String("postgres"),
+							EngineVersion:        aws.String("14.9"),
+							DBInstanceStatus:     aws.String("backing-up"),
 						},
 					},
 				}, nil)
@@ -201,12 +201,12 @@ func TestProvisionTargetDB(t *testing.T) {
 						{
 							DBInstanceIdentifier: aws.String("source-db"),
 							DBInstanceClass:      aws.String("db.r6g.medium"),
-							Engine:              aws.String("postgres"),
-							EngineVersion:       aws.String("14.9"),
-							AllocatedStorage:    aws.Int32(100),
-							StorageType:         aws.String("gp2"),
-							StorageEncrypted:    aws.Bool(true),
-							MasterUsername:      aws.String("postgres"),
+							Engine:               aws.String("postgres"),
+							EngineVersion:        aws.String("14.9"),
+							AllocatedStorage:     aws.Int32(100),
+							StorageType:          aws.String("gp2"),
+							StorageEncrypted:     aws.Bool(true),
+							MasterUsername:       aws.String("postgres"),
 							DBSubnetGroup: &types.DBSubnetGroup{
 								DBSubnetGroupName: aws.String("default-subnet-group"),
 							},
@@ -223,7 +223,7 @@ func TestProvisionTargetDB(t *testing.T) {
 					DBInstances: []types.DBInstance{
 						{
 							DBInstanceIdentifier: aws.String("source-db-upgrade-123"),
-							DBInstanceStatus:    aws.String("available"),
+							DBInstanceStatus:     aws.String("available"),
 						},
 					},
 				}, nil).AnyTimes()
@@ -249,24 +249,24 @@ func TestProvisionTargetDB(t *testing.T) {
 				TargetVersion:      "15.4",
 			},
 			setupMocks: func(mockRDS *mocks.MockRDSClient) {
-			mockRDS.EXPECT().DescribeDBInstances(gomock.Any(), gomock.Any(), gomock.Any()).Return(&rds.DescribeDBInstancesOutput{
-			DBInstances: []types.DBInstance{
-			{
-			DBInstanceIdentifier: aws.String("source-db"),
-			DBInstanceClass:      aws.String("db.r6g.medium"),
-			Engine:              aws.String("postgres"),
-			AllocatedStorage:    aws.Int32(100),
-			StorageType:         aws.String("gp2"),
-			MasterUsername:      aws.String("postgres"),
-			DBSubnetGroup: &types.DBSubnetGroup{
-			DBSubnetGroupName: aws.String("default-subnet-group"),
-			},
-			},
-			},
-			}, nil)
+				mockRDS.EXPECT().DescribeDBInstances(gomock.Any(), gomock.Any(), gomock.Any()).Return(&rds.DescribeDBInstancesOutput{
+					DBInstances: []types.DBInstance{
+						{
+							DBInstanceIdentifier: aws.String("source-db"),
+							DBInstanceClass:      aws.String("db.r6g.medium"),
+							Engine:               aws.String("postgres"),
+							AllocatedStorage:     aws.Int32(100),
+							StorageType:          aws.String("gp2"),
+							MasterUsername:       aws.String("postgres"),
+							DBSubnetGroup: &types.DBSubnetGroup{
+								DBSubnetGroupName: aws.String("default-subnet-group"),
+							},
+						},
+					},
+				}, nil)
 
-			mockRDS.EXPECT().CreateDBInstance(gomock.Any(), gomock.Any(), gomock.Any()).Return(
-			nil, errors.New("create failed"))
+				mockRDS.EXPECT().CreateDBInstance(gomock.Any(), gomock.Any(), gomock.Any()).Return(
+					nil, errors.New("create failed"))
 			},
 			expectErr: true,
 		},
@@ -506,9 +506,9 @@ func TestValidateInput_EdgeCases(t *testing.T) {
 			DBInstances: []types.DBInstance{
 				{
 					DBInstanceIdentifier: aws.String("source-db"),
-					Engine:              aws.String("postgres"),
-					EngineVersion:       aws.String("14.9"),
-					DBInstanceStatus:    aws.String("available"),
+					Engine:               aws.String("postgres"),
+					EngineVersion:        aws.String("14.9"),
+					DBInstanceStatus:     aws.String("available"),
 				},
 			},
 		}, nil)
@@ -537,9 +537,9 @@ func TestValidateInput_EdgeCases(t *testing.T) {
 			DBInstances: []types.DBInstance{
 				{
 					DBInstanceIdentifier: aws.String("source-db"),
-					Engine:              aws.String("postgres"),
-					EngineVersion:       aws.String("14.9"),
-					DBInstanceStatus:    aws.String("available"),
+					Engine:               aws.String("postgres"),
+					EngineVersion:        aws.String("14.9"),
+					DBInstanceStatus:     aws.String("available"),
 				},
 			},
 		}, nil)

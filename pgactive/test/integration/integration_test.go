@@ -13,17 +13,17 @@ import (
 	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/worker"
 
-	"company.com/infra/pgactive-upgrade/internal/activities"
-	"company.com/infra/pgactive-upgrade/internal/types"
-	"company.com/infra/pgactive-upgrade/internal/workflow"
+	"github.com/leowmjw/go-temporal-pg/pgactive/internal/activities"
+	"github.com/leowmjw/go-temporal-pg/pgactive/internal/types"
+	"github.com/leowmjw/go-temporal-pg/pgactive/internal/workflow"
 )
 
 type IntegrationTestSuite struct {
 	suite.Suite
 	testsuite.WorkflowTestSuite
-	client    client.Client
-	worker    worker.Worker
-	logger    *slog.Logger
+	client client.Client
+	worker worker.Worker
+	logger *slog.Logger
 }
 
 func TestIntegrationTestSuite(t *testing.T) {
@@ -48,10 +48,10 @@ func (s *IntegrationTestSuite) SetupSuite() {
 
 	// Create worker with mock activities for integration testing
 	s.worker = worker.New(s.client, workflow.TaskQueue, worker.Options{})
-	
+
 	// Register workflow
 	s.worker.RegisterWorkflow(workflow.RollingUpgradeWorkflow)
-	
+
 	// Register mock activities that simulate real behavior
 	mockActivities := &MockIntegrationActivities{logger: s.logger}
 	s.worker.RegisterActivity(mockActivities.ValidateInput)
@@ -65,7 +65,7 @@ func (s *IntegrationTestSuite) SetupSuite() {
 	s.worker.RegisterActivity(mockActivities.OptionallyDetachOld)
 	s.worker.RegisterActivity(mockActivities.DecommissionSource)
 	s.worker.RegisterActivity(mockActivities.ExecuteRollback)
-	
+
 	// Register child workflow
 	s.worker.RegisterWorkflow(mockActivities.InitReplicationGroupWorkflow)
 
@@ -85,7 +85,7 @@ func (s *IntegrationTestSuite) TearDownSuite() {
 
 func (s *IntegrationTestSuite) TestCompleteUpgradeFlow() {
 	ctx := context.Background()
-	
+
 	workflowOptions := client.StartWorkflowOptions{
 		ID:        "test-upgrade-" + time.Now().Format("20060102-150405"),
 		TaskQueue: workflow.TaskQueue,
@@ -95,8 +95,8 @@ func (s *IntegrationTestSuite) TestCompleteUpgradeFlow() {
 		SourceDBInstanceID: "test-source-db",
 		TargetVersion:      "15.4",
 		ShiftPercentages:   []int{25, 25, 50},
-		Subnets:           []string{"subnet-1", "subnet-2"},
-		SecurityGroupIDs:  []string{"sg-123"},
+		Subnets:            []string{"subnet-1", "subnet-2"},
+		SecurityGroupIDs:   []string{"sg-123"},
 		Tags: map[string]string{
 			"Environment": "test",
 			"Purpose":     "upgrade",
@@ -113,7 +113,7 @@ func (s *IntegrationTestSuite) TestCompleteUpgradeFlow() {
 		if err == nil {
 			var result types.ProgressResponse
 			progress.Get(&result)
-			s.logger.Info("Progress query result", 
+			s.logger.Info("Progress query result",
 				slog.String("phase", result.Phase),
 				slog.Int("percent", result.Percent),
 				slog.String("status", result.Status))
@@ -132,7 +132,7 @@ func (s *IntegrationTestSuite) TestCompleteUpgradeFlow() {
 
 func (s *IntegrationTestSuite) TestUpgradeWithRollback() {
 	ctx := context.Background()
-	
+
 	workflowOptions := client.StartWorkflowOptions{
 		ID:        "test-rollback-" + time.Now().Format("20060102-150405"),
 		TaskQueue: workflow.TaskQueue,
@@ -171,7 +171,7 @@ func (s *IntegrationTestSuite) TestUpgradeWithRollback() {
 
 func (s *IntegrationTestSuite) TestUpgradeWithFailedHealthCheck() {
 	ctx := context.Background()
-	
+
 	workflowOptions := client.StartWorkflowOptions{
 		ID:        "test-health-fail-" + time.Now().Format("20060102-150405"),
 		TaskQueue: workflow.TaskQueue,
@@ -200,11 +200,11 @@ func (s *IntegrationTestSuite) TestUpgradeWithFailedHealthCheck() {
 
 func (s *IntegrationTestSuite) TestConcurrentUpgrades() {
 	ctx := context.Background()
-	
+
 	// Start multiple concurrent upgrades
 	var workflows []client.WorkflowRun
-	
-	for i := 0; i < 3; i++ {
+
+	for i := range 3 {
 		workflowOptions := client.StartWorkflowOptions{
 			ID:        "concurrent-upgrade-" + time.Now().Format("20060102-150405") + "-" + string(rune('A'+i)),
 			TaskQueue: workflow.TaskQueue,
@@ -261,9 +261,9 @@ func (a *MockIntegrationActivities) InstallPgactiveExtension(ctx context.Context
 
 func (a *MockIntegrationActivities) WaitForSync(ctx context.Context, input types.ActivityInput) error {
 	a.logger.Info("Mock WaitForSync", slog.String("replication_group", input.ReplicationGroup))
-	
+
 	// Simulate gradual sync with heartbeats
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		time.Sleep(200 * time.Millisecond)
 		// In real activity, this would send heartbeats
 	}
@@ -271,7 +271,7 @@ func (a *MockIntegrationActivities) WaitForSync(ctx context.Context, input types
 }
 
 func (a *MockIntegrationActivities) TrafficShiftPhase(ctx context.Context, input types.TrafficShiftInput) error {
-	a.logger.Info("Mock TrafficShiftPhase", 
+	a.logger.Info("Mock TrafficShiftPhase",
 		slog.Int("phase", input.Phase),
 		slog.Int("percentage", input.ShiftPercentage))
 	time.Sleep(300 * time.Millisecond) // Simulate traffic shift
@@ -280,12 +280,12 @@ func (a *MockIntegrationActivities) TrafficShiftPhase(ctx context.Context, input
 
 func (a *MockIntegrationActivities) RunHealthChecks(ctx context.Context, input types.HealthCheckInput) error {
 	a.logger.Info("Mock RunHealthChecks", slog.String("check_type", input.CheckType))
-	
+
 	// Check for test environment variable to simulate failure
 	if os.Getenv("INTEGRATION_TEST_FAIL_HEALTH_CHECK") == "true" {
 		return activities.NewHealthCheckError("simulated health check failure")
 	}
-	
+
 	time.Sleep(200 * time.Millisecond) // Simulate health check
 	return nil
 }

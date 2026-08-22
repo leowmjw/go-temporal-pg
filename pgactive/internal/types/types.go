@@ -4,7 +4,7 @@ import "time"
 
 // UpgradeInput contains all parameters for the rolling upgrade workflow
 type UpgradeInput struct {
-	SourceDBInstanceID   string            `json:"source_db_instance_id"`
+	SourceDBInstanceID  string            `json:"source_db_instance_id"`
 	TargetVersion       string            `json:"target_version"`
 	Subnets             []string          `json:"subnets"`
 	ShiftPercentages    []int             `json:"shift_percentages"`

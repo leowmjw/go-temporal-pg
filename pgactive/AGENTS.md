@@ -20,23 +20,20 @@ The system implements a Temporal workflow with the following components:
 **IMPORTANT**: These specific versions work together and resolve dependency conflicts:
 
 ```
-go 1.22
-go.temporal.io/sdk v1.28.1
-github.com/aws/aws-sdk-go-v2 v1.30.3
-github.com/aws/aws-sdk-go-v2/service/rds v1.99.1
+go 1.27
+go.temporal.io/sdk v1.48.0
+github.com/aws/aws-sdk-go-v2 v1.43.7
+github.com/aws/aws-sdk-go-v2/service/rds v1.124.4
 github.com/golang/mock v1.6.0
-github.com/stretchr/testify v1.9.0
+github.com/stretchr/testify v1.12.1
 ```
 
 ## Commands & Testing
 
 ### Build & Test Commands
 ```bash
-# Build entire project
-go build ./...
-
-# Run all unit tests
-go test ./internal/... -v
+# Build and test all modules
+mise run check
 
 # Run specific test suites
 go test ./internal/workflow -v          # Workflow tests (passing)
@@ -46,8 +43,9 @@ go test ./test/integration -v           # Integration tests (needs Temporal serv
 # Run with coverage
 go test -v -race -coverprofile=coverage.out ./internal/...
 
-# Clean dependencies
-go mod tidy
+# Clean dependencies and apply source migrations
+mise run tidy
+mise run fix
 ```
 
 ### Docker & Integration Testing
@@ -84,19 +82,15 @@ docker-compose -f docker-compose.test.yml down
 
 ## Critical Technical Issues & Solutions
 
-### 1. Dependency Version Conflicts
-**Problem**: Temporal SDK v1.35.0+ conflicts with AWS SDK v2 versions
-**Solution**: Use Temporal SDK v1.28.1 with AWS SDK v2.30.3 - these versions are compatible
-
-### 2. Mock Interface Issues
+### 1. Mock Interface Issues
 **Problem**: Activities struct expected concrete `*rds.Client` but tests needed mocks
 **Solution**: Created `RDSClient` interface in activities.go and updated `NewActivities` to accept interface
 
-### 3. Temporal Testsuite API Changes
+### 2. Temporal Testsuite API Changes
 **Problem**: `env.OnActivity()` calls fail with "activity not registered" errors
 **Solution**: Use `env.RegisterActivity()` with mock activity implementations instead of `OnActivity`
 
-### 4. AWS SDK v2 Variadic Parameters
+### 3. AWS SDK v2 Variadic Parameters
 **Problem**: Mock expectations fail due to variadic function options in AWS SDK v2
 **Solution**: Add `gomock.Any()` as third parameter for all AWS SDK mock calls:
 ```go
@@ -187,4 +181,3 @@ go mod tidy                                 # Dependency management ✅
 # - Integration Tests: 3 real end-to-end tests with containers in ~3 seconds
 # - Total: 50+ tests, all passing, comprehensive coverage
 ```
-

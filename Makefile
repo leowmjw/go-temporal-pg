@@ -1,2 +1,2 @@
 run:
-	@mise dx
+	@mise run check
