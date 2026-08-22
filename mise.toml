@@ -39,15 +39,23 @@ go -C pgactive test ./...
 [tasks.build]
 description = "Build every Go module"
 run = """
-go build ./...
-go -C pgactive build ./...
+mkdir -p bin pgactive/bin
+go build -o bin/app .
+go -C pgactive build -o bin/pgactive .
+go -C pgactive build -o bin/pgactive-upgrade ./cmd
 """
 
 [tasks.check]
 description = "Format, vet, test, and build"
-run = [
-  "mise run fmt",
-  "mise run vet",
-  "mise run test",
-  "mise run build",
-]
+run = """
+go fmt ./...
+go -C pgactive fmt ./...
+go vet ./...
+go -C pgactive vet ./...
+go test ./...
+go -C pgactive test ./...
+mkdir -p bin pgactive/bin
+go build -o bin/app .
+go -C pgactive build -o bin/pgactive .
+go -C pgactive build -o bin/pgactive-upgrade ./cmd
+"""

@@ -27,12 +27,12 @@ import (
 type RealIntegrationTestSuite struct {
 	suite.Suite
 	testsuite.WorkflowTestSuite
-	
-	logger        *slog.Logger
-	pgContainer   *postgres.PostgresContainer
-	sourceDB      *sql.DB
-	targetDB      *sql.DB
-	
+
+	logger      *slog.Logger
+	pgContainer *postgres.PostgresContainer
+	sourceDB    *sql.DB
+	targetDB    *sql.DB
+
 	// Test environment
 	env *testsuite.TestWorkflowEnvironment
 }
@@ -93,17 +93,17 @@ func (s *RealIntegrationTestSuite) TearDownSuite() {
 func (s *RealIntegrationTestSuite) SetupTest() {
 	// Create a new test environment for each test
 	s.env = s.NewTestWorkflowEnvironment()
-	
+
 	// Register the workflow
 	s.env.RegisterWorkflow(workflow.RollingUpgradeWorkflow)
-	
+
 	// Create real activities (but with mock AWS calls)
 	realActivities := &RealTestActivities{
 		logger:   s.logger,
 		sourceDB: s.sourceDB,
 		targetDB: s.sourceDB, // For testing, use same DB
 	}
-	
+
 	// Register real activities
 	s.env.RegisterActivity(realActivities.ValidateInput)
 	s.env.RegisterActivity(realActivities.ProvisionTargetDB)
@@ -116,7 +116,7 @@ func (s *RealIntegrationTestSuite) SetupTest() {
 	s.env.RegisterActivity(realActivities.OptionallyDetachOld)
 	s.env.RegisterActivity(realActivities.DecommissionSource)
 	s.env.RegisterActivity(realActivities.ExecuteRollback)
-	
+
 	// Register child workflow
 	s.env.RegisterWorkflow(realActivities.InitReplicationGroupWorkflow)
 }
@@ -131,9 +131,9 @@ func (s *RealIntegrationTestSuite) TestRealWorkflowExecution() {
 		SourceDBInstanceID: "test-source-db",
 		TargetVersion:      "15.4",
 		ShiftPercentages:   []int{50, 50},
-		Subnets:           []string{"subnet-test"},
-		SecurityGroupIDs:  []string{"sg-test"},
-		InstanceClass:     "db.t3.micro",
+		Subnets:            []string{"subnet-test"},
+		SecurityGroupIDs:   []string{"sg-test"},
+		InstanceClass:      "db.t3.micro",
 		Tags: map[string]string{
 			"Environment": "test",
 			"Purpose":     "integration-test",
@@ -173,7 +173,7 @@ func (s *RealIntegrationTestSuite) TestRealWorkflowWithDatabaseOperations() {
 		SourceDBInstanceID: "test-db-ops",
 		TargetVersion:      "15.4",
 		ShiftPercentages:   []int{100},
-		InstanceClass:     "db.t3.micro",
+		InstanceClass:      "db.t3.micro",
 	}
 
 	// Execute workflow
@@ -212,7 +212,7 @@ func (s *RealIntegrationTestSuite) TestRealWorkflowRollback() {
 		SourceDBInstanceID: "test-rollback-db",
 		TargetVersion:      "15.4",
 		ShiftPercentages:   []int{100},
-		InstanceClass:     "db.t3.micro",
+		InstanceClass:      "db.t3.micro",
 	}
 
 	// Set environment variable to trigger rollback
@@ -275,7 +275,7 @@ type RealTestActivities struct {
 
 func (a *RealTestActivities) ValidateInput(ctx context.Context, input types.UpgradeInput) error {
 	a.logger.Info("Real ValidateInput", slog.String("source_db", input.SourceDBInstanceID))
-	
+
 	// Log to database
 	_, err := a.sourceDB.Exec(
 		"INSERT INTO test_upgrade_log (operation, details) VALUES ($1, $2)",
@@ -298,9 +298,9 @@ func (a *RealTestActivities) ValidateInput(ctx context.Context, input types.Upgr
 
 func (a *RealTestActivities) ProvisionTargetDB(ctx context.Context, input types.UpgradeInput) (string, error) {
 	a.logger.Info("Real ProvisionTargetDB", slog.String("source_db", input.SourceDBInstanceID))
-	
+
 	targetID := fmt.Sprintf("%s-target-%d", input.SourceDBInstanceID, time.Now().Unix())
-	
+
 	// Log to database
 	_, err := a.sourceDB.Exec(
 		"INSERT INTO test_upgrade_log (operation, details) VALUES ($1, $2)",
@@ -312,13 +312,13 @@ func (a *RealTestActivities) ProvisionTargetDB(ctx context.Context, input types.
 
 	// Simulate DB provisioning time
 	time.Sleep(100 * time.Millisecond)
-	
+
 	return targetID, nil
 }
 
 func (a *RealTestActivities) ConfigurePgactiveParams(ctx context.Context, input types.ActivityInput) error {
 	a.logger.Info("Real ConfigurePgactiveParams", slog.String("target_db", input.TargetDBInstanceID))
-	
+
 	// Log to database
 	_, err := a.sourceDB.Exec(
 		"INSERT INTO test_upgrade_log (operation, details) VALUES ($1, $2)",
@@ -333,7 +333,7 @@ func (a *RealTestActivities) ConfigurePgactiveParams(ctx context.Context, input 
 
 func (a *RealTestActivities) InstallPgactiveExtension(ctx context.Context, input types.ActivityInput) error {
 	a.logger.Info("Real InstallPgactiveExtension", slog.String("target_db", input.TargetDBInstanceID))
-	
+
 	// Log to database
 	_, err := a.sourceDB.Exec(
 		"INSERT INTO test_upgrade_log (operation, details) VALUES ($1, $2)",
@@ -348,7 +348,7 @@ func (a *RealTestActivities) InstallPgactiveExtension(ctx context.Context, input
 
 func (a *RealTestActivities) WaitForSync(ctx context.Context, input types.ActivityInput) error {
 	a.logger.Info("Real WaitForSync", slog.String("replication_group", input.ReplicationGroup))
-	
+
 	// Log to database
 	_, err := a.sourceDB.Exec(
 		"INSERT INTO test_upgrade_log (operation, details) VALUES ($1, $2)",
@@ -364,10 +364,10 @@ func (a *RealTestActivities) WaitForSync(ctx context.Context, input types.Activi
 }
 
 func (a *RealTestActivities) TrafficShiftPhase(ctx context.Context, input types.TrafficShiftInput) error {
-	a.logger.Info("Real TrafficShiftPhase", 
+	a.logger.Info("Real TrafficShiftPhase",
 		slog.Int("phase", input.Phase),
 		slog.Int("percentage", input.ShiftPercentage))
-	
+
 	// Log to database
 	_, err := a.sourceDB.Exec(
 		"INSERT INTO test_upgrade_log (operation, details) VALUES ($1, $2)",
@@ -382,12 +382,12 @@ func (a *RealTestActivities) TrafficShiftPhase(ctx context.Context, input types.
 
 func (a *RealTestActivities) RunHealthChecks(ctx context.Context, input types.HealthCheckInput) error {
 	a.logger.Info("Real RunHealthChecks", slog.String("check_type", input.CheckType))
-	
+
 	// Check for test rollback trigger
 	if os.Getenv("TEST_TRIGGER_ROLLBACK") == "true" {
 		return activities.NewHealthCheckError("test-triggered health check failure")
 	}
-	
+
 	// Log to database
 	_, err := a.sourceDB.Exec(
 		"INSERT INTO test_upgrade_log (operation, details) VALUES ($1, $2)",
@@ -402,7 +402,7 @@ func (a *RealTestActivities) RunHealthChecks(ctx context.Context, input types.He
 
 func (a *RealTestActivities) Cutover(ctx context.Context, input types.ActivityInput) error {
 	a.logger.Info("Real Cutover", slog.String("target_db", input.TargetDBInstanceID))
-	
+
 	// Log to database
 	_, err := a.sourceDB.Exec(
 		"INSERT INTO test_upgrade_log (operation, details) VALUES ($1, $2)",
@@ -417,7 +417,7 @@ func (a *RealTestActivities) Cutover(ctx context.Context, input types.ActivityIn
 
 func (a *RealTestActivities) OptionallyDetachOld(ctx context.Context, input types.ActivityInput) error {
 	a.logger.Info("Real OptionallyDetachOld", slog.String("source_db", input.SourceDBInstanceID))
-	
+
 	// Log to database
 	_, err := a.sourceDB.Exec(
 		"INSERT INTO test_upgrade_log (operation, details) VALUES ($1, $2)",
@@ -432,7 +432,7 @@ func (a *RealTestActivities) OptionallyDetachOld(ctx context.Context, input type
 
 func (a *RealTestActivities) DecommissionSource(ctx context.Context, input types.ActivityInput) error {
 	a.logger.Info("Real DecommissionSource", slog.String("source_db", input.SourceDBInstanceID))
-	
+
 	// Log to database
 	_, err := a.sourceDB.Exec(
 		"INSERT INTO test_upgrade_log (operation, details) VALUES ($1, $2)",
@@ -447,7 +447,7 @@ func (a *RealTestActivities) DecommissionSource(ctx context.Context, input types
 
 func (a *RealTestActivities) ExecuteRollback(ctx context.Context, input types.ActivityInput) error {
 	a.logger.Info("Real ExecuteRollback", slog.String("source_db", input.SourceDBInstanceID))
-	
+
 	// Log to database
 	_, err := a.sourceDB.Exec(
 		"INSERT INTO test_upgrade_log (operation, details) VALUES ($1, $2)",
@@ -463,11 +463,11 @@ func (a *RealTestActivities) ExecuteRollback(ctx context.Context, input types.Ac
 func (a *RealTestActivities) InitReplicationGroupWorkflow(ctx temporalworkflow.Context, input types.ActivityInput) (string, error) {
 	logger := temporalworkflow.GetLogger(ctx)
 	logger.Info("Real InitReplicationGroupWorkflow", "source_db", input.SourceDBInstanceID)
-	
+
 	groupID := fmt.Sprintf("repl-group-%s-%d", input.SourceDBInstanceID, temporalworkflow.Now(ctx).Unix())
-	
+
 	// This is a simple child workflow that just returns a group ID
 	// In a real implementation, this would orchestrate replication setup
-	
+
 	return groupID, nil
 }

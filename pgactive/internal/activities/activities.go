@@ -71,40 +71,40 @@ func (a *Activities) ValidateInput(ctx context.Context, input types.UpgradeInput
 	describeInput := &rds.DescribeDBInstancesInput{
 		DBInstanceIdentifier: aws.String(input.SourceDBInstanceID),
 	}
-	
+
 	result, err := a.RDS.DescribeDBInstances(ctx, describeInput)
 	if err != nil {
 		return fmt.Errorf("failed to describe source DB instance: %w", err)
 	}
-	
+
 	if len(result.DBInstances) == 0 {
 		return fmt.Errorf("source DB instance %s not found", input.SourceDBInstanceID)
 	}
-	
+
 	sourceDB := result.DBInstances[0]
-	
+
 	// Validate DB is PostgreSQL
 	if *sourceDB.Engine != "postgres" {
 		return fmt.Errorf("source DB must be PostgreSQL, got %s", *sourceDB.Engine)
 	}
-	
+
 	// Validate DB is available
 	if *sourceDB.DBInstanceStatus != "available" {
 		return fmt.Errorf("source DB must be in 'available' status, got %s", *sourceDB.DBInstanceStatus)
 	}
-	
+
 	// Validate target version is newer
 	currentVersion := *sourceDB.EngineVersion
 	if input.TargetVersion <= currentVersion {
-		return fmt.Errorf("target version %s must be newer than current version %s", 
+		return fmt.Errorf("target version %s must be newer than current version %s",
 			input.TargetVersion, currentVersion)
 	}
-	
+
 	// Validate shift percentages
 	if len(input.ShiftPercentages) == 0 {
 		return fmt.Errorf("at least one shift percentage must be specified")
 	}
-	
+
 	total := 0
 	for _, pct := range input.ShiftPercentages {
 		if pct < 0 || pct > 100 {
@@ -112,7 +112,7 @@ func (a *Activities) ValidateInput(ctx context.Context, input types.UpgradeInput
 		}
 		total += pct
 	}
-	
+
 	if total != 100 {
 		return fmt.Errorf("shift percentages must sum to 100, got %d", total)
 	}
@@ -132,46 +132,46 @@ func (a *Activities) ProvisionTargetDB(ctx context.Context, input types.UpgradeI
 	describeInput := &rds.DescribeDBInstancesInput{
 		DBInstanceIdentifier: aws.String(input.SourceDBInstanceID),
 	}
-	
+
 	result, err := a.RDS.DescribeDBInstances(ctx, describeInput)
 	if err != nil {
 		return "", fmt.Errorf("failed to describe source DB: %w", err)
 	}
-	
+
 	sourceDB := result.DBInstances[0]
-	
+
 	// Generate target DB identifier
 	targetDBID := fmt.Sprintf("%s-upgrade-%d", input.SourceDBInstanceID, time.Now().Unix())
-	
+
 	// Use provided instance class or default to source's class
 	instanceClass := input.InstanceClass
 	if instanceClass == "" {
 		instanceClass = *sourceDB.DBInstanceClass
 	}
-	
+
 	// Create target DB instance
 	createInput := &rds.CreateDBInstanceInput{
-		DBInstanceIdentifier:   aws.String(targetDBID),
-		DBInstanceClass:        aws.String(instanceClass),
-		Engine:                 aws.String("postgres"),
-		EngineVersion:          aws.String(input.TargetVersion),
-		AllocatedStorage:       sourceDB.AllocatedStorage,
-		StorageType:            sourceDB.StorageType,
-		StorageEncrypted:       sourceDB.StorageEncrypted,
-		KmsKeyId:               sourceDB.KmsKeyId,
-		MasterUsername:         sourceDB.MasterUsername,
+		DBInstanceIdentifier:     aws.String(targetDBID),
+		DBInstanceClass:          aws.String(instanceClass),
+		Engine:                   aws.String("postgres"),
+		EngineVersion:            aws.String(input.TargetVersion),
+		AllocatedStorage:         sourceDB.AllocatedStorage,
+		StorageType:              sourceDB.StorageType,
+		StorageEncrypted:         sourceDB.StorageEncrypted,
+		KmsKeyId:                 sourceDB.KmsKeyId,
+		MasterUsername:           sourceDB.MasterUsername,
 		ManageMasterUserPassword: aws.Bool(true),
-		DBSubnetGroupName:      sourceDB.DBSubnetGroup.DBSubnetGroupName,
-		VpcSecurityGroupIds:    input.SecurityGroupIDs,
-		BackupRetentionPeriod:  aws.Int32(int32(input.BackupRetentionDays)),
-		Tags: convertTags(input.Tags),
+		DBSubnetGroupName:        sourceDB.DBSubnetGroup.DBSubnetGroupName,
+		VpcSecurityGroupIds:      input.SecurityGroupIDs,
+		BackupRetentionPeriod:    aws.Int32(int32(input.BackupRetentionDays)),
+		Tags:                     convertTags(input.Tags),
 	}
-	
+
 	_, err = a.RDS.CreateDBInstance(ctx, createInput)
 	if err != nil {
 		return "", fmt.Errorf("failed to create target DB instance: %w", err)
 	}
-	
+
 	// Wait for DB to become available
 	waiter := rds.NewDBInstanceAvailableWaiter(a.RDS)
 	err = waiter.Wait(ctx, &rds.DescribeDBInstancesInput{
@@ -180,7 +180,7 @@ func (a *Activities) ProvisionTargetDB(ctx context.Context, input types.UpgradeI
 	if err != nil {
 		return "", fmt.Errorf("target DB did not become available in time: %w", err)
 	}
-	
+
 	logger.Info("Target DB provisioned successfully", slog.String("target_db", targetDBID))
 	return targetDBID, nil
 }
@@ -198,15 +198,15 @@ func (a *Activities) ConfigurePgactiveParams(ctx context.Context, input types.Ac
 		describeInput := &rds.DescribeDBInstancesInput{
 			DBInstanceIdentifier: aws.String(dbID),
 		}
-		
+
 		result, err := a.RDS.DescribeDBInstances(ctx, describeInput)
 		if err != nil {
 			return fmt.Errorf("failed to describe DB instance %s: %w", dbID, err)
 		}
-		
+
 		db := result.DBInstances[0]
 		paramGroupName := *db.DBParameterGroups[0].DBParameterGroupName
-		
+
 		// Modify parameter group to enable pgactive
 		modifyInput := &rds.ModifyDBParameterGroupInput{
 			DBParameterGroupName: aws.String(paramGroupName),
@@ -233,23 +233,23 @@ func (a *Activities) ConfigurePgactiveParams(ctx context.Context, input types.Ac
 				},
 			},
 		}
-		
+
 		_, err = a.RDS.ModifyDBParameterGroup(ctx, modifyInput)
 		if err != nil {
 			return fmt.Errorf("failed to modify parameter group for %s: %w", dbID, err)
 		}
-		
+
 		// Reboot instance to apply parameters
 		rebootInput := &rds.RebootDBInstanceInput{
 			DBInstanceIdentifier: aws.String(dbID),
-			ForceFailover:       aws.Bool(false),
+			ForceFailover:        aws.Bool(false),
 		}
-		
+
 		_, err = a.RDS.RebootDBInstance(ctx, rebootInput)
 		if err != nil {
 			return fmt.Errorf("failed to reboot DB instance %s: %w", dbID, err)
 		}
-		
+
 		// Wait for instance to become available again
 		waiter := rds.NewDBInstanceAvailableWaiter(a.RDS)
 		err = waiter.Wait(ctx, &rds.DescribeDBInstancesInput{
@@ -259,7 +259,7 @@ func (a *Activities) ConfigurePgactiveParams(ctx context.Context, input types.Ac
 			return fmt.Errorf("DB instance %s did not become available after reboot: %w", dbID, err)
 		}
 	}
-	
+
 	logger.Info("pgactive parameters configured successfully")
 	return nil
 }
@@ -279,26 +279,26 @@ func (a *Activities) InstallPgactiveExtension(ctx context.Context, input types.A
 			return fmt.Errorf("failed to connect to DB %s: %w", dbID, err)
 		}
 		defer db.Close()
-		
+
 		// Create pgactive extension
 		_, err = db.ExecContext(ctx, "CREATE EXTENSION IF NOT EXISTS pgactive")
 		if err != nil {
 			return fmt.Errorf("failed to create pgactive extension on %s: %w", dbID, err)
 		}
-		
+
 		// Verify extension is installed
 		var extensionExists bool
-		err = db.QueryRowContext(ctx, 
+		err = db.QueryRowContext(ctx,
 			"SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'pgactive')").Scan(&extensionExists)
 		if err != nil {
 			return fmt.Errorf("failed to verify pgactive extension on %s: %w", dbID, err)
 		}
-		
+
 		if !extensionExists {
 			return fmt.Errorf("pgactive extension not properly installed on %s", dbID)
 		}
 	}
-	
+
 	logger.Info("pgactive extension installed successfully")
 	return nil
 }
@@ -311,7 +311,7 @@ func (a *Activities) WaitForSync(ctx context.Context, input types.ActivityInput)
 
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -319,21 +319,21 @@ func (a *Activities) WaitForSync(ctx context.Context, input types.ActivityInput)
 		case <-ticker.C:
 			// Send heartbeat
 			activity.RecordHeartbeat(ctx, "checking replication lag")
-			
+
 			// Check replication lag
 			lag, err := a.getReplicationLag(ctx, input.SourceDBInstanceID, input.ReplicationGroup)
 			if err != nil {
 				a.Log.Warn("Failed to check replication lag", slog.String("error", err.Error()))
 				continue
 			}
-			
+
 			a.Log.Info("Replication lag check", slog.Int64("lag_bytes", lag))
-			
+
 			if lag == 0 {
 				logger.Info("Replication is synchronized")
 				return nil
 			}
-			
+
 			// Check if lag is concerning (> 15 minutes worth of changes)
 			if lag > 15*1024*1024*1024 { // 15GB as rough estimate
 				return fmt.Errorf("replication lag too high: %d bytes", lag)
@@ -352,7 +352,7 @@ func (a *Activities) TrafficShiftPhase(ctx context.Context, input types.TrafficS
 	// This would integrate with your traffic routing system
 	// For now, we'll simulate the traffic shift
 	time.Sleep(2 * time.Second)
-	
+
 	logger.Info("Traffic shift completed successfully")
 	return nil
 }
@@ -368,20 +368,20 @@ func (a *Activities) RunHealthChecks(ctx context.Context, input types.HealthChec
 		return fmt.Errorf("failed to connect to target DB: %w", err)
 	}
 	defer db.Close()
-	
+
 	// Basic connectivity check
 	err = db.PingContext(ctx)
 	if err != nil {
 		return fmt.Errorf("target DB ping failed: %w", err)
 	}
-	
+
 	// Check if pgactive is working
 	var activeConnections int
 	err = db.QueryRowContext(ctx, "SELECT count(*) FROM pg_stat_replication").Scan(&activeConnections)
 	if err != nil {
 		return fmt.Errorf("failed to check replication status: %w", err)
 	}
-	
+
 	logger.Info("Health checks passed", slog.Int("active_connections", activeConnections))
 	return nil
 }
@@ -394,7 +394,7 @@ func (a *Activities) Cutover(ctx context.Context, input types.ActivityInput) err
 	// This would update your application configuration, load balancers, etc.
 	// to point to the new target database
 	time.Sleep(1 * time.Second)
-	
+
 	logger.Info("Cutover completed successfully")
 	return nil
 }
@@ -410,13 +410,13 @@ func (a *Activities) OptionallyDetachOld(ctx context.Context, input types.Activi
 		return fmt.Errorf("failed to connect to source DB: %w", err)
 	}
 	defer db.Close()
-	
+
 	// Remove from replication group (pgactive specific command)
 	_, err = db.ExecContext(ctx, fmt.Sprintf("SELECT pgactive_remove_node('%s')", input.ReplicationGroup))
 	if err != nil {
 		return fmt.Errorf("failed to remove node from replication group: %w", err)
 	}
-	
+
 	logger.Info("Old DB detached successfully")
 	return nil
 }
@@ -428,19 +428,19 @@ func (a *Activities) DecommissionSource(ctx context.Context, input types.Activit
 
 	// Create final snapshot before deletion
 	snapshotID := fmt.Sprintf("%s-final-snapshot-%d", input.SourceDBInstanceID, time.Now().Unix())
-	
+
 	deleteInput := &rds.DeleteDBInstanceInput{
 		DBInstanceIdentifier:      aws.String(input.SourceDBInstanceID),
-		SkipFinalSnapshot:        aws.Bool(false),
+		SkipFinalSnapshot:         aws.Bool(false),
 		FinalDBSnapshotIdentifier: aws.String(snapshotID),
-		DeleteAutomatedBackups:   aws.Bool(true),
+		DeleteAutomatedBackups:    aws.Bool(true),
 	}
-	
+
 	_, err := a.RDS.DeleteDBInstance(ctx, deleteInput)
 	if err != nil {
 		return fmt.Errorf("failed to delete source DB instance: %w", err)
 	}
-	
+
 	logger.Info("Source DB decommissioned successfully", slog.String("snapshot", snapshotID))
 	return nil
 }
@@ -453,14 +453,14 @@ func (a *Activities) ExecuteRollback(ctx context.Context, input types.ActivityIn
 	// Reverse traffic back to source
 	// Stop replication
 	// Clean up target resources
-	
+
 	// This is a simplified rollback - in reality you'd need to:
 	// 1. Redirect traffic back to source DB
 	// 2. Stop and clean up replication
 	// 3. Optionally delete the target DB
-	
+
 	time.Sleep(2 * time.Second)
-	
+
 	logger.Info("Rollback executed successfully")
 	return nil
 }
@@ -472,16 +472,16 @@ func (a *Activities) getDBConnection(ctx context.Context, dbInstanceID string) (
 	describeInput := &rds.DescribeDBInstancesInput{
 		DBInstanceIdentifier: aws.String(dbInstanceID),
 	}
-	
+
 	result, err := a.RDS.DescribeDBInstances(ctx, describeInput)
 	if err != nil {
 		return nil, fmt.Errorf("failed to describe DB instance: %w", err)
 	}
-	
+
 	db := result.DBInstances[0]
 	endpoint := *db.Endpoint.Address
 	port := db.Endpoint.Port
-	
+
 	// Get credentials from Secrets Manager
 	secretARN := *db.MasterUserSecret.SecretArn
 	secretOutput, err := a.SecretsClient.GetSecretValue(ctx, &secretsmanager.GetSecretValueInput{
@@ -490,12 +490,12 @@ func (a *Activities) getDBConnection(ctx context.Context, dbInstanceID string) (
 	if err != nil {
 		return nil, fmt.Errorf("failed to get DB credentials: %w", err)
 	}
-	
+
 	// Parse secret value to get username/password
 	// This is simplified - you'd parse the JSON secret
 	connStr := fmt.Sprintf("host=%s port=%d dbname=postgres sslmode=require user=postgres password=%s",
 		endpoint, port, *secretOutput.SecretString)
-	
+
 	return sql.Open("postgres", connStr)
 }
 

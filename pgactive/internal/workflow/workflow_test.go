@@ -24,20 +24,20 @@ func TestWorkflowTestSuite(t *testing.T) {
 
 // Mock activities for testing
 type MockActivities struct {
-	validateInputResult        error
-	provisionTargetDBResult    string
-	provisionTargetDBError     error
-	configurePgactiveResult    error
-	installExtensionResult     error
-	waitForSyncResult          error
-	trafficShiftResult         error
-	runHealthChecksResult      error
-	cutoverResult              error
-	optionallyDetachOldResult  error
-	decommissionSourceResult   error
-	executeRollbackResult      error
-	childWorkflowResult        string
-	childWorkflowError         error
+	validateInputResult       error
+	provisionTargetDBResult   string
+	provisionTargetDBError    error
+	configurePgactiveResult   error
+	installExtensionResult    error
+	waitForSyncResult         error
+	trafficShiftResult        error
+	runHealthChecksResult     error
+	cutoverResult             error
+	optionallyDetachOldResult error
+	decommissionSourceResult  error
+	executeRollbackResult     error
+	childWorkflowResult       string
+	childWorkflowError        error
 }
 
 func (m *MockActivities) ValidateInput(ctx context.Context, input types.UpgradeInput) error {
@@ -109,7 +109,7 @@ func (s *WorkflowTestSuite) TestRollingUpgradeWorkflow_HappyPath() {
 	env.RegisterActivity(mockActivities.Cutover)
 	env.RegisterActivity(mockActivities.OptionallyDetachOld)
 	env.RegisterActivity(mockActivities.DecommissionSource)
-	
+
 	// Register child workflow
 	env.RegisterWorkflow(mockActivities.InitReplicationGroupWorkflow)
 
@@ -117,8 +117,8 @@ func (s *WorkflowTestSuite) TestRollingUpgradeWorkflow_HappyPath() {
 		SourceDBInstanceID: "source-db",
 		TargetVersion:      "15.4",
 		ShiftPercentages:   []int{25, 25, 50},
-		Subnets:           []string{"subnet-1", "subnet-2"},
-		SecurityGroupIDs:  []string{"sg-123"},
+		Subnets:            []string{"subnet-1", "subnet-2"},
+		SecurityGroupIDs:   []string{"sg-123"},
 	}
 
 	env.ExecuteWorkflow(RollingUpgradeWorkflow, input)
