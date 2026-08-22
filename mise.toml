@@ -1,0 +1,53 @@
+[tools]
+go = "1.27.0"
+
+[tasks.fix]
+description = "Apply Go source migrations in every module"
+run = """
+go fix ./...
+go -C pgactive fix ./...
+"""
+
+[tasks.fmt]
+description = "Format every Go module"
+run = """
+go fmt ./...
+go -C pgactive fmt ./...
+"""
+
+[tasks.tidy]
+description = "Tidy every Go module"
+run = """
+go mod tidy
+go -C pgactive mod tidy
+"""
+
+[tasks.vet]
+description = "Vet every Go module"
+run = """
+go vet ./...
+go -C pgactive vet ./...
+"""
+
+[tasks.test]
+description = "Run all tests"
+run = """
+go test ./...
+go -C pgactive test ./...
+"""
+
+[tasks.build]
+description = "Build every Go module"
+run = """
+go build ./...
+go -C pgactive build ./...
+"""
+
+[tasks.check]
+description = "Format, vet, test, and build"
+run = [
+  "mise run fmt",
+  "mise run vet",
+  "mise run test",
+  "mise run build",
+]

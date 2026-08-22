@@ -14,8 +14,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"company.com/infra/pgactive-upgrade/internal/activities/mocks"
-	upgradetypes "company.com/infra/pgactive-upgrade/internal/types"
+	"github.com/leowmjw/go-temporal-pg/pgactive/internal/activities/mocks"
+	upgradetypes "github.com/leowmjw/go-temporal-pg/pgactive/internal/types"
 )
 
 func TestValidateInput(t *testing.T) {

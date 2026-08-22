@@ -13,8 +13,8 @@ import (
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
 
-	"company.com/infra/pgactive-upgrade/internal/activities"
-	"company.com/infra/pgactive-upgrade/internal/workflow"
+	"github.com/leowmjw/go-temporal-pg/pgactive/internal/activities"
+	"github.com/leowmjw/go-temporal-pg/pgactive/internal/workflow"
 )
 
 func main() {

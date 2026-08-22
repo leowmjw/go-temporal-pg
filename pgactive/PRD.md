@@ -9,7 +9,7 @@
 
 ## 1. Executive Summary
 
-Automate a rolling major‑version upgrade of Amazon RDS for PostgreSQL using **pgactive** orchestrated via an idiomatic **Temporal workflow** in **Go 1.24.5**, using `log/slog` and Go’s standard library. Achieves minimal downtime, safe rollbacks, observability, testability, and compliance.
+Automate a rolling major‑version upgrade of Amazon RDS for PostgreSQL using **pgactive** orchestrated via an idiomatic **Temporal workflow** in **Go 1.27**, using `log/slog` and Go’s standard library. Achieves minimal downtime, safe rollbacks, observability, testability, and compliance.
 
 ---
 
@@ -41,7 +41,7 @@ Automate a rolling major‑version upgrade of Amazon RDS for PostgreSQL using **
 - **pgactive** enables bidirectional logical replication for live upgrades  
 - In-place upgrades cause unacceptable downtime  
 - **Temporal** ensures durable, predictable orchestration with retries  
-- **Go 1.24.5** + `log/slog` support structured logging and silent testing
+- **Go 1.27** + `log/slog` support structured logging and silent testing
 
 ---
 
@@ -142,7 +142,7 @@ func (a *Installer) ConfigurePgactiveParams(ctx context.Context, in ParamsInput)
 
 | Week | Milestone                                   |
 |------|---------------------------------------------|
-| 0    | Repo scaffold, CI/CD with Go 1.24.5        |
+| 0    | Repo scaffold, CI/CD with Go 1.27          |
 | 2    | MVP Activities implemented                  |
 | 4    | Full Workflow + Dev integration testing     |
 | 5    | Performance/load testing on sample data     |
@@ -191,10 +191,9 @@ slog.SetDefault(slog.New(handler))
 - AWS Docs: pgactive extension and replication group  
 - AWS Docs: enabling pgactive, extension setup  
 - PostgreSQL docs: logical replication fundamentals  
-- Go 1.24 Release Notes (`log/slog`)  
+- Go 1.27 Release Notes (`log/slog`)  
 - Temporal Go SDK: logging and telemetry integration
 
 ---
 
 *Markdown file ready for agent ingestion — save as `PRD.md` for implementation.*
-

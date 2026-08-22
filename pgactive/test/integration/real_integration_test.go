@@ -17,9 +17,9 @@ import (
 	"go.temporal.io/sdk/testsuite"
 	temporalworkflow "go.temporal.io/sdk/workflow"
 
-	"company.com/infra/pgactive-upgrade/internal/activities"
-	"company.com/infra/pgactive-upgrade/internal/types"
-	"company.com/infra/pgactive-upgrade/internal/workflow"
+	"github.com/leowmjw/go-temporal-pg/pgactive/internal/activities"
+	"github.com/leowmjw/go-temporal-pg/pgactive/internal/types"
+	"github.com/leowmjw/go-temporal-pg/pgactive/internal/workflow"
 
 	_ "github.com/lib/pq"
 )

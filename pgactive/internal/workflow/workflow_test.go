@@ -10,7 +10,7 @@ import (
 	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/workflow"
 
-	"company.com/infra/pgactive-upgrade/internal/types"
+	"github.com/leowmjw/go-temporal-pg/pgactive/internal/types"
 )
 
 type WorkflowTestSuite struct {

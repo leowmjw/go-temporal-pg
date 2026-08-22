@@ -1,3 +1,3 @@
 module app
 
-go 1.26rc1
+go 1.27.0

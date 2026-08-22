@@ -13,7 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	"go.temporal.io/sdk/activity"
 
-	"company.com/infra/pgactive-upgrade/internal/types"
+	"github.com/leowmjw/go-temporal-pg/pgactive/internal/types"
 )
 
 // RDSClient interface for mocking AWS RDS operations
