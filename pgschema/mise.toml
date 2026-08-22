@@ -1,0 +1,61 @@
+# pgschema/mise.toml — tool versions and task definitions for the pgschema module.
+# Run tasks with: mise run <task>
+
+[tools]
+go = "1.27.0"
+# pgroll: zero-downtime schema migrations for PostgreSQL
+# Installed via go install so it's in GOPATH/bin
+# pgroll = "0.16.2"   # uncomment if mise has a pgroll plugin
+# pgstream: CDC / anonymization pipeline for PostgreSQL
+# pgstream = "1.4.1"  # uncomment if mise has a pgstream plugin
+
+[tasks.install-tools]
+description = "Install pgroll and pgstream binaries"
+run = [
+  "go install github.com/xataio/pgroll/cmd/pgroll@v0.16.2",
+  "go install github.com/xataio/pgstream/cmd/pgstream@v1.4.1",
+]
+
+[tasks.fmt]
+description = "Format all Go source files"
+run = "go fmt ./..."
+
+[tasks.vet]
+description = "Run go vet"
+run = "go vet ./..."
+
+[tasks.test]
+description = "Run unit tests"
+run = "go test ./internal/... -v -race -count=1"
+
+[tasks.test-integration]
+description = "Run integration tests (requires Docker and real binaries)"
+run = "go test ./test/integration/... -v -race -count=1 -tags integration"
+
+[tasks.build]
+description = "Build the pgschema worker binary"
+run = "go build -o bin/pgschema ./cmd/pgschema"
+
+[tasks.check]
+description = "Format, vet, test, and build"
+depends = ["fmt", "vet", "test", "build"]
+
+[tasks.migrate-start]
+description = "Start a pgroll migration (set PGROLL_DSN and MIGRATION_FILE env vars)"
+run = "pgroll --dsn $PGROLL_DSN --schema ${SCHEMA:-public} start < $MIGRATION_FILE"
+
+[tasks.migrate-complete]
+description = "Complete the active pgroll migration"
+run = "pgroll --dsn $PGROLL_DSN --schema ${SCHEMA:-public} complete"
+
+[tasks.migrate-rollback]
+description = "Roll back the active pgroll migration"
+run = "pgroll --dsn $PGROLL_DSN --schema ${SCHEMA:-public} rollback"
+
+[tasks.stream-start]
+description = "Start a pgstream CDC pipeline (set SOURCE_DSN and TARGET_DSN)"
+run = "pgstream run --source postgres --source-url $SOURCE_DSN --target postgres --target-url $TARGET_DSN --init"
+
+[tasks.worker]
+description = "Run the pgschema Temporal worker (requires TEMPORAL_ADDRESS env)"
+run = "bin/pgschema"
