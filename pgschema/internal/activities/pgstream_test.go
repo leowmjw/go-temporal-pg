@@ -8,6 +8,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/converter"
+	"go.temporal.io/sdk/testsuite"
 
 	"github.com/leowmjw/go-temporal-pg/pgschema/internal/types"
 )
@@ -234,6 +237,92 @@ func TestRunStream_CancelledByContext(t *testing.T) {
 	require.Error(t, err, "error must be returned")
 }
 
+// ── RunStream heartbeats ─────────────────────────────────────────────────────
+//
+// Regression test for the missing-heartbeat bug: RunStream's default
+// implementation used to call a.RunFn(ctx, cfg) directly and block until it
+// returned, without ever calling safeHeartbeat while waiting — even though
+// CDCStreamWorkflow schedules it with a 2-minute HeartbeatTimeout. A
+// long-lived, healthy stream would still get killed and retried on that
+// timeout. This verifies RunStream now heartbeats on a ticker while RunFn is
+// still running, not just once before starting it.
+
+func TestRunStream_HeartbeatsWhileRunFnBlocks(t *testing.T) {
+	unblock := make(chan struct{})
+	a := newTestPgstreamActivities(nil,
+		func(ctx context.Context, _ types.StreamConfig) error {
+			<-unblock
+			return nil
+		},
+		nil, nil,
+	)
+
+	var ts testsuite.WorkflowTestSuite
+	env := ts.NewTestActivityEnvironment()
+	env.RegisterActivity(a.RunStream)
+
+	heartbeats := make(chan struct{}, 10)
+	env.SetOnActivityHeartbeatListener(func(_ *activity.Info, _ converter.EncodedValues) {
+		select {
+		case heartbeats <- struct{}{}:
+		default:
+		}
+	})
+
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := env.ExecuteActivity(a.RunStream, types.StreamConfig{StreamID: "s1"})
+		resultCh <- err
+	}()
+
+	// At least the initial "stream_starting" heartbeat must fire even before
+	// RunFn returns.
+	select {
+	case <-heartbeats:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected at least one heartbeat while RunFn was still blocked")
+	}
+
+	close(unblock)
+	require.NoError(t, <-resultCh)
+}
+
+// ── PollLag heartbeats ───────────────────────────────────────────────────────
+//
+// Regression test: PollLag's default ticker loop used to never call
+// safeHeartbeat despite its own doc comment claiming it does, and despite
+// being scheduled with a 2-minute HeartbeatTimeout in cdc_stream.go.
+
+func TestPollLag_Heartbeats(t *testing.T) {
+	a := newTestPgstreamActivities(nil, nil, nil,
+		func(_ context.Context, _ types.StreamConfig) (int64, error) { return 1234, nil },
+	)
+
+	var ts testsuite.WorkflowTestSuite
+	env := ts.NewTestActivityEnvironment()
+	env.RegisterActivity(a.PollLag)
+
+	heartbeats := make(chan struct{}, 10)
+	env.SetOnActivityHeartbeatListener(func(_ *activity.Info, _ converter.EncodedValues) {
+		select {
+		case heartbeats <- struct{}{}:
+		default:
+		}
+	})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = env.ExecuteActivity(a.PollLag, types.StreamConfig{StreamID: "s1"}, time.Millisecond)
+	}()
+
+	select {
+	case <-heartbeats:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected PollLag to heartbeat")
+	}
+}
+
 // ── StopStream ────────────────────────────────────────────────────────────────
 
 func TestStopStream_Success(t *testing.T) {
@@ -251,4 +340,22 @@ func TestStopStream_Success(t *testing.T) {
 	_, err := env.ExecuteActivity(a.StopStream, types.StreamConfig{StreamID: "s1"})
 	require.NoError(t, err)
 	assert.True(t, stopped)
+}
+
+// ── parseLagBytes ────────────────────────────────────────────────────────────
+//
+// Regression test: defaultGetLag used to discard the pgstream status output
+// entirely (`_ = out`) and unconditionally `return 0, nil`, so the CDC
+// workflow's lag query always reported zero regardless of real replication
+// lag. parseLagBytes is the extracted, unit-testable parsing step.
+
+func TestParseLagBytes(t *testing.T) {
+	lag, err := parseLagBytes([]byte(`{"lag_bytes": 4096}`))
+	require.NoError(t, err)
+	assert.Equal(t, int64(4096), lag)
+}
+
+func TestParseLagBytes_MalformedJSON(t *testing.T) {
+	_, err := parseLagBytes([]byte(`not json`))
+	require.Error(t, err)
 }

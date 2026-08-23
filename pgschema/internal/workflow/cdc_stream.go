@@ -60,12 +60,22 @@ func CDCStreamWorkflow(ctx workflow.Context, cfg types.StreamConfig) error {
 		return fmt.Errorf("register lag query: %w", err)
 	}
 
+	// restartCh signals the Step-4 loop that anonymization rules changed.
+	// The already-running RunStream activity is an external OS process that
+	// cannot be hot-reloaded, so the only way to actually apply new rules is
+	// to cancel the current stream/lag activities and ContinueAsNew with the
+	// updated cfg — which is what draining this channel triggers below.
+	restartCh := workflow.NewBufferedChannel(ctx, 4)
+
 	// ── Update handler — operator can change anonymization rules mid-stream ──
 	if err := workflow.SetUpdateHandlerWithOptions(ctx,
 		"update-anon-rules",
-		func(_ workflow.Context, rules []types.AnonymizationRule) (string, error) {
+		func(uCtx workflow.Context, rules []types.AnonymizationRule) (string, error) {
 			cfg.AnonymizationRules = rules
-			return fmt.Sprintf("anonymization rules updated: %d rules", len(rules)), nil
+			restartCh.Send(uCtx, struct{}{})
+			return fmt.Sprintf(
+				"anonymization rules updated: %d rules; stream restarting to apply them",
+				len(rules)), nil
 		},
 		workflow.UpdateHandlerOptions{
 			Validator: func(_ workflow.Context, rules []types.AnonymizationRule) error {
@@ -100,26 +110,37 @@ func CDCStreamWorkflow(ctx workflow.Context, cfg types.StreamConfig) error {
 		return &types.StreamError{StreamID: cfg.StreamID, Wrapped: err}
 	}
 
+	// runCtx is a cancellable child of ctx that scopes both the long-running
+	// RunStream activity and the concurrent lag-polling goroutine below.
+	// Cancelling it is what actually stops them — without this, nothing ever
+	// signals PollLag/RunStream to return and the workflow can hang waiting
+	// on lagDone.Receive indefinitely (up to their 7-day StartToCloseTimeout).
+	runCtx, cancelRun := workflow.WithCancel(ctx)
+
 	// ── Step 2: Long-running stream activity ──────────────────────────────────
 	streamOpts := workflow.ActivityOptions{
 		StartToCloseTimeout: 7 * 24 * time.Hour, // long-lived
 		HeartbeatTimeout:    2 * time.Minute,
 		RetryPolicy: &temporal.RetryPolicy{
-			MaximumAttempts:    0, // unlimited retries
+			// MaximumAttempts must be bounded: with 0 (unlimited) a permanently
+			// broken stream (bad DSN, revoked replication slot) retries forever
+			// and streamFuture never resolves, so the "stream died -> alert
+			// operator" path below is unreachable no matter how badly it fails.
+			MaximumAttempts:    20,
 			InitialInterval:    5 * time.Second,
 			BackoffCoefficient: 1.5,
 			MaximumInterval:    5 * time.Minute,
 		},
 	}
 	streamFuture := workflow.ExecuteActivity(
-		workflow.WithActivityOptions(ctx, streamOpts),
+		workflow.WithActivityOptions(runCtx, streamOpts),
 		(*activities.PgstreamActivities).RunStream, cfg,
 	)
 
 	// ── Step 3: Concurrent lag polling ────────────────────────────────────────
 	// workflow.Go runs in the same coroutine scheduler — safe for Temporal.
 	lagDone := workflow.NewChannel(ctx)
-	workflow.Go(ctx, func(gCtx workflow.Context) {
+	workflow.Go(runCtx, func(gCtx workflow.Context) {
 		defer lagDone.Send(gCtx, struct{}{})
 		lagOpts := workflow.ActivityOptions{
 			StartToCloseTimeout: 7 * 24 * time.Hour,
@@ -134,12 +155,12 @@ func CDCStreamWorkflow(ctx workflow.Context, cfg types.StreamConfig) error {
 		lagState.LastChecked = workflow.Now(gCtx)
 	})
 
-	// ── Step 4: Wait for stop signal, stream failure, or ContinueAsNew ───────
+	// ── Step 4: Wait for stop signal, stream failure, rule update, or ContinueAsNew ──
 	iterations := 0
 	sel := workflow.NewSelector(ctx)
 
 	var streamErr error
-	var stopped bool
+	var stopped, restart bool
 
 	sel.AddFuture(streamFuture, func(f workflow.Future) {
 		streamErr = f.Get(ctx, nil)
@@ -148,8 +169,12 @@ func CDCStreamWorkflow(ctx workflow.Context, cfg types.StreamConfig) error {
 		c.Receive(ctx, nil)
 		stopped = true
 	})
+	sel.AddReceive(restartCh, func(c workflow.ReceiveChannel, _ bool) {
+		c.Receive(ctx, nil)
+		restart = true
+	})
 
-	for !stopped && streamErr == nil {
+	for !stopped && streamErr == nil && !restart {
 		sel.Select(ctx)
 		iterations++
 
@@ -161,18 +186,35 @@ func CDCStreamWorkflow(ctx workflow.Context, cfg types.StreamConfig) error {
 			}
 			stopped = true
 		}
+		// Drain any queued rule-update restart requests.
+		for {
+			var r struct{}
+			if !restartCh.ReceiveAsync(&r) {
+				break
+			}
+			restart = true
+		}
 
-		if iterations >= cfg.MaxIterations && !stopped && streamErr == nil {
+		if iterations >= cfg.MaxIterations && !stopped && streamErr == nil && !restart {
 			// ContinueAsNew keeps the event history bounded.
+			cancelRun()
+			lagDone.Receive(ctx, nil)
 			logger.Info("CDCStreamWorkflow ContinueAsNew",
 				slog.Int("iterations", iterations))
 			return workflow.NewContinueAsNewError(ctx, CDCStreamWorkflow, cfg)
 		}
 	}
 
-	// Cancel the lag-polling goroutine by cancelling the root ctx.
-	// (In practice, cancellation propagates via Temporal's cancel activity API.)
+	// Cancel the lag-polling goroutine and the stream activity by cancelling
+	// runCtx, then wait for the lag goroutine to actually observe it and exit.
+	cancelRun()
 	lagDone.Receive(ctx, nil)
+
+	if stopped {
+		logger.Info("CDCStreamWorkflow stopped cleanly",
+			slog.String("stream_id", cfg.StreamID))
+		return nil
+	}
 
 	if streamErr != nil {
 		// Wrap and page.
@@ -184,7 +226,9 @@ func CDCStreamWorkflow(ctx workflow.Context, cfg types.StreamConfig) error {
 		return streamErr
 	}
 
-	logger.Info("CDCStreamWorkflow stopped cleanly",
+	// restart must be true here: the loop only exits via stopped, streamErr,
+	// or restart. Continue as new so the fresh run picks up the new rules.
+	logger.Info("CDCStreamWorkflow restarting to apply updated anonymization rules",
 		slog.String("stream_id", cfg.StreamID))
-	return nil
+	return workflow.NewContinueAsNewError(ctx, CDCStreamWorkflow, cfg)
 }

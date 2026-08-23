@@ -41,6 +41,10 @@ func main() {
 	pgstreamActs := activities.NewPgstreamActivities(log)
 	previewActs := activities.NewPreviewDBActivities(log)
 	alertActs := activities.NewAlertActivities(log)
+	alertActs.DefaultWebhookURL = os.Getenv("PGSCHEMA_ALERT_WEBHOOK_URL")
+	if alertActs.DefaultWebhookURL == "" {
+		log.Warn("PGSCHEMA_ALERT_WEBHOOK_URL not set; operator paging is disabled")
+	}
 
 	migrationWorker := worker.New(c, workflow.SchemaMigrationTaskQueue, worker.Options{})
 	migrationWorker.RegisterWorkflow(workflow.SchemaMigrationWorkflow)

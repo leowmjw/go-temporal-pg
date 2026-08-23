@@ -18,9 +18,16 @@ import (
 
 // AlertActivities holds the human-escalation Temporal activity.
 type AlertActivities struct {
-	PageFn     func(ctx context.Context, msg types.AlertMessage) error
-	httpClient *http.Client
-	log        *slog.Logger
+	PageFn func(ctx context.Context, msg types.AlertMessage) error
+	// DefaultWebhookURL is used when an AlertMessage arrives with no
+	// WebhookURL set. Every real caller in this codebase (pageOperator in
+	// the workflow package) builds AlertMessage without ever setting
+	// WebhookURL, so without a configured default no paging ever happens —
+	// set this from NewAlertActivities/main.go via an environment variable
+	// or similar operator-supplied config.
+	DefaultWebhookURL string
+	httpClient        *http.Client
+	log               *slog.Logger
 }
 
 // NewAlertActivities returns an AlertActivities that POSTs to the webhook URL
@@ -59,7 +66,11 @@ func (a *AlertActivities) Page(ctx context.Context, msg types.AlertMessage) erro
 // ─── Default (HTTP webhook) implementation ────────────────────────────────────
 
 func (a *AlertActivities) defaultPage(ctx context.Context, msg types.AlertMessage) error {
-	if msg.WebhookURL == "" {
+	webhookURL := msg.WebhookURL
+	if webhookURL == "" {
+		webhookURL = a.DefaultWebhookURL
+	}
+	if webhookURL == "" {
 		a.logger().WarnContext(ctx, "no webhook URL configured; alert dropped",
 			slog.String("title", msg.Title))
 		return nil
@@ -70,7 +81,7 @@ func (a *AlertActivities) defaultPage(ctx context.Context, msg types.AlertMessag
 		return fmt.Errorf("marshal alert: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, msg.WebhookURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, webhookURL, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}

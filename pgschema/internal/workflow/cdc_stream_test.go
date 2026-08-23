@@ -156,6 +156,14 @@ func (s *CDCStreamTestSuite) TestStreamDies_AlertFired() {
 		f.pgstream.RunFn = func(_ context.Context, _ types.StreamConfig) error {
 			return errors.New("pgstream: connection to source lost")
 		}
+		// RunStream retries (bounded, see cdc_stream.go) before finally
+		// failing. The default PollLagFn blocks on ctx.Done() forever, which
+		// this scenario doesn't need and which interferes with the test
+		// clock's ability to skip through the retry backoffs — so give this
+		// test a lag poller that just returns immediately instead.
+		f.pgstream.PollLagFn = func(ctx context.Context, _ types.StreamConfig, _ time.Duration) (int64, error) {
+			return 0, nil
+		}
 		f.alert.PageFn = func(_ context.Context, _ types.AlertMessage) error {
 			alertFired = true
 			return nil
@@ -171,16 +179,25 @@ func (s *CDCStreamTestSuite) TestStreamDies_AlertFired() {
 
 // ── UpdateAnonymizationRules ──────────────────────────────────────────────────
 
+// TestUpdateAnonymizationRules_Valid verifies the update is accepted and
+// returns a confirmation message. Since the already-running RunStream
+// activity is an external process that cannot be hot-reloaded, applying new
+// rules now correctly triggers an immediate ContinueAsNew (see
+// TestUpdateAnonymizationRules_TriggersRestart) rather than silently
+// discarding them — so, unlike the other Update tests in this file, this one
+// does not also send a stop signal afterwards: the restart happens first and
+// races out the workflow before a subsequently-queued stop signal would ever
+// be processed.
 func (s *CDCStreamTestSuite) TestUpdateAnonymizationRules_Valid() {
 	fake := newFakeStream()
 	fake.register(s.env)
 
+	var updateResult string
+	var updateErr error
 	s.env.RegisterDelayedCallback(func() {
 		rules := []types.AnonymizationRule{
 			{Table: "users", Column: "email", Transformer: "email"},
 		}
-		var updateResult string
-		var updateErr error
 		uc := &testsuite.TestUpdateCallback{
 			OnAccept:   func() {},
 			OnReject:   func(err error) { updateErr = err },
@@ -192,33 +209,69 @@ func (s *CDCStreamTestSuite) TestUpdateAnonymizationRules_Valid() {
 			},
 		}
 		s.env.UpdateWorkflow("update-anon-rules", "", uc, rules)
+	}, 1*time.Millisecond)
+
+	// The update's own handler invocation is queued as a callback and is only
+	// drained *after* the callback above returns, so assertions on the
+	// outcome must happen in a later callback.
+	s.env.RegisterDelayedCallback(func() {
 		s.NoError(updateErr)
 		s.Contains(updateResult, "rules")
+	}, 2*time.Millisecond)
 
-		s.env.SignalWorkflow(SignalStopStream, nil)
+	s.env.ExecuteWorkflow(CDCStreamWorkflow, defaultStreamConfig())
+	s.True(s.env.IsWorkflowCompleted())
+	// The workflow ContinueAsNew'd to apply the new rules — the Go SDK
+	// testsuite surfaces that as a non-nil workflow error wrapping
+	// workflow.ErrContinueAsNew (see TestContinueAsNew_AfterMaxIterations).
+	s.Error(s.env.GetWorkflowError())
+}
+
+// TestUpdateAnonymizationRules_TriggersRestart is the direct regression test
+// for the fix: applying new anonymization rules mid-stream must actually take
+// effect, which (since RunStream wraps an external, non-hot-reloadable
+// process) means restarting via ContinueAsNew rather than silently updating
+// workflow-local state nothing downstream ever reads.
+func (s *CDCStreamTestSuite) TestUpdateAnonymizationRules_TriggersRestart() {
+	fake := newFakeStream()
+	fake.register(s.env)
+
+	s.env.RegisterDelayedCallback(func() {
+		rules := []types.AnonymizationRule{
+			{Table: "users", Column: "email", Transformer: "email"},
+		}
+		uc := &testsuite.TestUpdateCallback{
+			OnAccept:   func() {},
+			OnReject:   func(err error) { s.Fail("update should not be rejected", err) },
+			OnComplete: func(_ interface{}, _ error) {},
+		}
+		s.env.UpdateWorkflow("update-anon-rules", "", uc, rules)
 	}, 1*time.Millisecond)
 
 	s.env.ExecuteWorkflow(CDCStreamWorkflow, defaultStreamConfig())
 	s.True(s.env.IsWorkflowCompleted())
-	s.NoError(s.env.GetWorkflowError())
+	s.Error(s.env.GetWorkflowError(), "workflow must ContinueAsNew to apply the updated rules")
 }
 
 func (s *CDCStreamTestSuite) TestUpdateAnonymizationRules_EmptyRejected() {
 	fake := newFakeStream()
 	fake.register(s.env)
 
+	var rejected bool
 	s.env.RegisterDelayedCallback(func() {
-		var rejected bool
 		uc := &testsuite.TestUpdateCallback{
 			OnAccept: func() { s.Fail("should not accept empty rules") },
 			OnReject: func(err error) { rejected = true },
 			OnComplete: func(_ interface{}, _ error) {},
 		}
 		s.env.UpdateWorkflow("update-anon-rules", "", uc, []types.AnonymizationRule{})
+	}, 1*time.Millisecond)
+
+	s.env.RegisterDelayedCallback(func() {
 		s.True(rejected, "empty rules must be rejected by validator")
 
 		s.env.SignalWorkflow(SignalStopStream, nil)
-	}, 1*time.Millisecond)
+	}, 2*time.Millisecond)
 
 	s.env.ExecuteWorkflow(CDCStreamWorkflow, defaultStreamConfig())
 	s.True(s.env.IsWorkflowCompleted())

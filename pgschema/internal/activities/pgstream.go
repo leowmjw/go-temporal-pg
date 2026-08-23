@@ -6,6 +6,7 @@ package activities
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os/exec"
@@ -71,10 +72,26 @@ func (a *PgstreamActivities) RunStream(ctx context.Context, cfg types.StreamConf
 		slog.String("stream_id", cfg.StreamID))
 	safeHeartbeat(ctx, "stream_starting")
 
-	if err := a.RunFn(ctx, cfg); err != nil {
-		return &types.StreamError{StreamID: cfg.StreamID, Wrapped: err}
+	// RunFn (the real implementation shells out and blocks for the entire
+	// stream lifetime, up to days). Run it in its own goroutine and heartbeat
+	// on a ticker while we wait, so Temporal's HeartbeatTimeout doesn't fire
+	// and force spurious retries of an otherwise-healthy stream.
+	resultCh := make(chan error, 1)
+	go func() { resultCh <- a.RunFn(ctx, cfg) }()
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case err := <-resultCh:
+			if err != nil {
+				return &types.StreamError{StreamID: cfg.StreamID, Wrapped: err}
+			}
+			return nil
+		case <-ticker.C:
+			safeHeartbeat(ctx, "stream_running")
+		}
 	}
-	return nil
 }
 
 // PollLag polls replication lag on a fixed interval until ctx is cancelled.
@@ -105,12 +122,14 @@ func (a *PgstreamActivities) PollLag(ctx context.Context, cfg types.StreamConfig
 				a.logger().WarnContext(ctx, "failed to get lag",
 					slog.String("stream_id", cfg.StreamID),
 					slog.String("error", err.Error()))
+				safeHeartbeat(ctx, "lag_poll_error")
 				continue
 			}
 			lastLag = lag
 			a.logger().InfoContext(ctx, "replication lag",
 				slog.String("stream_id", cfg.StreamID),
 				slog.Int64("lag_bytes", lag))
+			safeHeartbeat(ctx, fmt.Sprintf("lag_bytes=%d", lastLag))
 		}
 	}
 }
@@ -153,7 +172,7 @@ func (a *PgstreamActivities) defaultRun(ctx context.Context, cfg types.StreamCon
 		"--target", "postgres",
 		"--target-url", cfg.TargetDSN,
 	}
-	return runPgstream(ctx, args)
+	return runPgstreamHeartbeating(ctx, args, cfg.StreamID)
 }
 
 func (a *PgstreamActivities) defaultStop(_ context.Context, _ types.StreamConfig) error {
@@ -164,17 +183,60 @@ func (a *PgstreamActivities) defaultStop(_ context.Context, _ types.StreamConfig
 
 func (a *PgstreamActivities) defaultGetLag(ctx context.Context, cfg types.StreamConfig) (int64, error) {
 	// pgstream exposes lag via its status command (implementation-specific).
-	// Placeholder: real implementation would query the replication slot lag.
 	args := []string{"status", "--pgstream-pgurl", cfg.SourceDSN, "--output", "json"}
 	out, err := runPgstreamOutput(ctx, args)
 	if err != nil {
 		return 0, err
 	}
-	// Parse lag from JSON output (simplified).
-	_ = out
-	return 0, nil
+	return parseLagBytes(out)
 }
 
+// parseLagBytes extracts the replication lag (in bytes) from `pgstream status
+// --output json` output.  Split out from defaultGetLag so it can be unit
+// tested without shelling out to the real pgstream binary.
+func parseLagBytes(out []byte) (int64, error) {
+	var status struct {
+		LagBytes int64 `json:"lag_bytes"`
+	}
+	if err := json.Unmarshal(out, &status); err != nil {
+		return 0, fmt.Errorf("parsing pgstream status output: %w", err)
+	}
+	return status.LagBytes, nil
+}
+
+
+// runPgstreamHeartbeating runs a pgstream subcommand that may block for a long
+// time (e.g. `run`, which drives the CDC stream for up to 7 days) and records
+// a heartbeat on a fixed interval while it does, so Temporal's HeartbeatTimeout
+// does not fire against a healthy but silent process.
+func runPgstreamHeartbeating(ctx context.Context, args []string, streamID string) error {
+	cmd := exec.CommandContext(ctx, "pgstream", args...)
+	var combined strings.Builder
+	cmd.Stdout = &combined
+	cmd.Stderr = &combined
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("pgstream %s: %w", strings.Join(args, " "), err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case err := <-done:
+			if err != nil {
+				return fmt.Errorf("pgstream %s: %w\n%s", strings.Join(args, " "), err, combined.String())
+			}
+			return nil
+		case <-ticker.C:
+			safeHeartbeat(ctx, fmt.Sprintf("stream_id=%s running", streamID))
+		}
+	}
+}
 
 func runPgstream(ctx context.Context, args []string) error {
 	out, err := exec.CommandContext(ctx, "pgstream", args...).CombinedOutput()

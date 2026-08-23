@@ -7,8 +7,10 @@ package activities
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -119,13 +121,24 @@ func previewDBName(previewID string) string {
 
 func (a *PreviewDBActivities) defaultClone(ctx context.Context, input types.PreviewCloneInput) (string, error) {
 	dbName := previewDBName(input.PreviewID)
+	base := baseConnStr(input.SourceDSN)
+	targetDSN := joinDBName(base, dbName)
+	maintenanceDSN := joinDBName(base, "postgres")
 
-	// 1. Extract host/port/user from source DSN for createdb + psql.
-	// 2. pg_dump source | psql target
+	// 0. The target database does not exist yet — pg_dump/psql only transfer
+	//    schema+data, they never create the destination database themselves.
+	createOut, err := exec.CommandContext(ctx, "psql", maintenanceDSN,
+		"-c", fmt.Sprintf("CREATE DATABASE %q", dbName)).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("create preview database: %w\n%s", err, string(createOut))
+	}
+
+	// 1. pg_dump (plain SQL) | psql target.
+	// NOTE: --format=custom produces a binary archive that only pg_restore
+	// (not psql) can read; plain-text SQL output is required for this pipe.
 	dumpCmd := exec.CommandContext(ctx, "pg_dump",
-		"--no-owner", "--no-acl", "--format=custom", input.SourceDSN)
-	restoreCmd := exec.CommandContext(ctx, "psql",
-		fmt.Sprintf("%s/%s", baseConnStr(input.SourceDSN), dbName))
+		"--no-owner", "--no-acl", "--format=plain", input.SourceDSN)
+	restoreCmd := exec.CommandContext(ctx, "psql", targetDSN)
 
 	pipe, err := dumpCmd.StdoutPipe()
 	if err != nil {
@@ -142,17 +155,50 @@ func (a *PreviewDBActivities) defaultClone(ctx context.Context, input types.Prev
 	if err := dumpCmd.Wait(); err != nil {
 		return "", fmt.Errorf("pg_dump wait: %w", err)
 	}
-	return fmt.Sprintf("%s/%s", baseConnStr(input.SourceDSN), dbName), nil
+	return targetDSN, nil
 }
 
 func (a *PreviewDBActivities) defaultApplyAnonymization(ctx context.Context, input types.AnonymizationInput) error {
-	// pgstream snapshot mode with transformer rules applied inline.
-	// In production: write transformer config to a temp file and pass --config.
 	args := []string{
 		"snapshot",
 		"--pgstream-pgurl", input.TargetDSN,
 	}
+	if len(input.Rules) == 0 {
+		return runPgstream(ctx, args)
+	}
+
+	cfgData, err := marshalAnonymizationConfig(input.Rules)
+	if err != nil {
+		return fmt.Errorf("build anonymization config: %w", err)
+	}
+	cfgFile, err := os.CreateTemp("", "pgstream-anon-*.json")
+	if err != nil {
+		return fmt.Errorf("write anonymization config: %w", err)
+	}
+	defer os.Remove(cfgFile.Name())
+	if _, err := cfgFile.Write(cfgData); err != nil {
+		cfgFile.Close()
+		return fmt.Errorf("write anonymization config: %w", err)
+	}
+	if err := cfgFile.Close(); err != nil {
+		return fmt.Errorf("write anonymization config: %w", err)
+	}
+
+	args = append(args, "--config", cfgFile.Name())
 	return runPgstream(ctx, args)
+}
+
+// anonymizationConfig is the transformer config document passed to
+// `pgstream snapshot --config`.
+type anonymizationConfig struct {
+	Transformers []types.AnonymizationRule `json:"transformers"`
+}
+
+// marshalAnonymizationConfig builds the pgstream transformer config JSON for
+// a set of anonymization rules. Split out from defaultApplyAnonymization so
+// the rule-to-config mapping can be unit tested without shelling out.
+func marshalAnonymizationConfig(rules []types.AnonymizationRule) ([]byte, error) {
+	return json.Marshal(anonymizationConfig{Transformers: rules})
 }
 
 func (a *PreviewDBActivities) defaultRunMigrationPreview(ctx context.Context, targetDSN, migrationJSON string) error {
@@ -168,7 +214,7 @@ func (a *PreviewDBActivities) defaultDrop(ctx context.Context, targetDSN string)
 	}
 	// Extract dbname from DSN and DROP DATABASE.
 	dbName := extractDBName(targetDSN)
-	out, err = exec.CommandContext(ctx, "psql", baseConnStr(targetDSN)+"/postgres",
+	out, err = exec.CommandContext(ctx, "psql", joinDBName(baseConnStr(targetDSN), "postgres"),
 		"-c", fmt.Sprintf("DROP DATABASE IF EXISTS %q", dbName)).
 		CombinedOutput()
 	if err != nil {
@@ -198,6 +244,21 @@ func baseConnStr(dsn string) string {
 		}
 	}
 	return strings.Join(filtered, " ")
+}
+
+// joinDBName appends dbName to a base connection string produced by
+// baseConnStr, respecting whether base is URI-form ("scheme://host:port") or
+// keyword=value form ("host=... user=..."). Naively concatenating "/dbname"
+// onto a keyword=value base corrupts the last keyword's value instead of
+// selecting a database.
+func joinDBName(base, dbName string) string {
+	if strings.Contains(base, "://") {
+		return base + "/" + dbName
+	}
+	if base == "" {
+		return "dbname=" + dbName
+	}
+	return base + " dbname=" + dbName
 }
 
 func extractDBName(dsn string) string {

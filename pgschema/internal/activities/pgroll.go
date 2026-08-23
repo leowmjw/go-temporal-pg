@@ -144,12 +144,30 @@ func runPgroll(ctx context.Context, dsn, schema string, args []string, migration
 func redactDSN(dsn string) string {
 	pwKey := " password="
 	if i := strings.Index(dsn, pwKey); i >= 0 {
-		rest := dsn[i+len(pwKey):]
-		end := strings.IndexAny(rest, " 	")
-		if end < 0 {
-			end = len(rest)
+		valStart := i + len(pwKey)
+		end := valStart
+		if valStart < len(dsn) && dsn[valStart] == '\'' {
+			// Quoted value (libpq allows this so the value can contain
+			// spaces): skip to the matching, non-escaped closing quote so we
+			// don't stop redacting partway through the real password.
+			end++
+			for end < len(dsn) {
+				if dsn[end] == '\\' && end+1 < len(dsn) {
+					end += 2
+					continue
+				}
+				if dsn[end] == '\'' {
+					end++
+					break
+				}
+				end++
+			}
+		} else {
+			for end < len(dsn) && dsn[end] != ' ' && dsn[end] != '\t' {
+				end++
+			}
 		}
-		return dsn[:i] + pwKey + "******" + rest[end:]
+		return dsn[:valStart] + "******" + dsn[end:]
 	}
 	if i := strings.Index(dsn, "://"); i >= 0 {
 		after := dsn[i+3:]

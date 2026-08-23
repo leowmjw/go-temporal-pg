@@ -243,13 +243,62 @@ func (s *PreviewCloneTestSuite) TestDropFailure_AlertFired() {
 
 // ── UpdateHandler — extend TTL ────────────────────────────────────────────────
 
+// TestUpdateHandler_ExtendTTL_ActuallyDelaysDrop is the direct regression
+// test for the extend-ttl fix: previously the handler updated
+// endpoint.ExpiresAt (visible via query) but never touched the already-
+// scheduled ttlTimer that actually controls when DropPreviewDatabase runs,
+// so the DB could be dropped while the query still claimed time remaining.
+// This asserts the clone is NOT dropped once the original TTL has passed, as
+// long as an extension was granted before then.
+func (s *PreviewCloneTestSuite) TestUpdateHandler_ExtendTTL_ActuallyDelaysDrop() {
+	dropCalled := false
+	fake := newFakePreview(func(f *fakePreview) {
+		f.previewDB.DropFn = func(_ context.Context, _ string) error {
+			dropCalled = true
+			return nil
+		}
+	})
+	fake.register(s.env)
+
+	in := defaultPreviewInput()
+	in.TTL = 10 * time.Millisecond
+
+	var updateErr error
+	s.env.RegisterDelayedCallback(func() {
+		uc := &testsuite.TestUpdateCallback{
+			OnAccept:   func() {},
+			OnReject:   func(err error) { updateErr = err },
+			OnComplete: func(_ interface{}, err error) { updateErr = err },
+		}
+		s.env.UpdateWorkflow("extend-ttl", "", uc, 2*time.Hour)
+	}, 5*time.Millisecond)
+
+	s.env.RegisterDelayedCallback(func() {
+		s.NoError(updateErr, "extend-ttl must be accepted")
+	}, 6*time.Millisecond)
+
+	// Past the ORIGINAL 10ms TTL but well before the extended (2h) deadline.
+	s.env.RegisterDelayedCallback(func() {
+		s.False(dropCalled, "extend-ttl must actually delay the drop, not just say it did")
+	}, 50*time.Millisecond)
+
+	s.env.RegisterDelayedCallback(func() {
+		s.env.SignalWorkflow(SignalCleanup, nil)
+	}, 100*time.Millisecond)
+
+	s.env.ExecuteWorkflow(PreviewCloneWorkflow, in)
+	s.True(s.env.IsWorkflowCompleted())
+	s.NoError(s.env.GetWorkflowError())
+	s.True(dropCalled, "clone must still be dropped once cleanup is requested")
+}
+
 func (s *PreviewCloneTestSuite) TestUpdateHandler_ExtendTTL_Valid() {
 	fake := newFakePreview()
 	fake.register(s.env)
 
+	var updateResult string
+	var updateErr error
 	s.env.RegisterDelayedCallback(func() {
-		var updateResult string
-		var updateErr error
 		uc := &testsuite.TestUpdateCallback{
 			OnAccept:   func() {},
 			OnReject:   func(err error) { updateErr = err },
@@ -261,11 +310,17 @@ func (s *PreviewCloneTestSuite) TestUpdateHandler_ExtendTTL_Valid() {
 			},
 		}
 		s.env.UpdateWorkflow("extend-ttl", "", uc, 2*time.Hour)
+	}, 5*time.Millisecond)
+
+	// The update's own handler invocation is queued as a callback and is only
+	// drained *after* the callback above returns, so assertions on the
+	// outcome — and the cleanup signal that follows — must happen later.
+	s.env.RegisterDelayedCallback(func() {
 		s.NoError(updateErr)
 		s.Contains(updateResult, "extended")
 
 		s.env.SignalWorkflow(SignalCleanup, nil)
-	}, 5*time.Millisecond)
+	}, 6*time.Millisecond)
 
 	s.env.ExecuteWorkflow(PreviewCloneWorkflow, defaultPreviewInput())
 	s.True(s.env.IsWorkflowCompleted())
@@ -276,18 +331,21 @@ func (s *PreviewCloneTestSuite) TestUpdateHandler_ExtendTTL_TooLong() {
 	fake := newFakePreview()
 	fake.register(s.env)
 
+	var rejected bool
 	s.env.RegisterDelayedCallback(func() {
-		var rejected bool
 		uc := &testsuite.TestUpdateCallback{
 			OnAccept: func() { s.Fail("should not accept TTL > 24h") },
 			OnReject: func(err error) { rejected = true },
 			OnComplete: func(_ interface{}, _ error) {},
 		}
 		s.env.UpdateWorkflow("extend-ttl", "", uc, 25*time.Hour)
+	}, 5*time.Millisecond)
+
+	s.env.RegisterDelayedCallback(func() {
 		s.True(rejected, "extension > 24h must be rejected by validator")
 
 		s.env.SignalWorkflow(SignalCleanup, nil)
-	}, 5*time.Millisecond)
+	}, 6*time.Millisecond)
 
 	s.env.ExecuteWorkflow(PreviewCloneWorkflow, defaultPreviewInput())
 	s.True(s.env.IsWorkflowCompleted())

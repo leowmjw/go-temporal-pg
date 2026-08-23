@@ -2,6 +2,7 @@ package activities
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"testing/synctest"
@@ -301,4 +302,89 @@ func TestExtractDBName(t *testing.T) {
 	for _, tc := range cases {
 		assert.Equal(t, tc.want, extractDBName(tc.in))
 	}
+}
+
+// ── joinDBName ────────────────────────────────────────────────────────────────
+//
+// Regression test: defaultClone used to build the target DSN as
+// baseConnStr(dsn)+"/"+dbName unconditionally, which only produces a valid
+// connection string for URI-form DSNs. For keyword=value DSNs it corrupted
+// the last keyword's value instead of selecting a database (e.g.
+// "...sslmode=disable/preview_x" instead of "...sslmode=disable
+// dbname=preview_x"), and the corrupted string could not be round-tripped
+// back through extractDBName in defaultDrop, silently leaking the preview DB.
+
+func TestJoinDBName(t *testing.T) {
+	cases := []struct {
+		name string
+		base string
+		db   string
+		want string
+	}{
+		{
+			name: "URI form appends /dbname",
+			base: "scheme://localhost:5432",
+			db:   "preview_abc",
+			want: "scheme://localhost:5432/preview_abc",
+		},
+		{
+			name: "keyword=value form appends dbname= token",
+			base: "host=localhost port=5432 user=pg",
+			db:   "preview_abc",
+			want: "host=localhost port=5432 user=pg dbname=preview_abc",
+		},
+		{
+			name: "empty base still produces a usable dbname= token",
+			base: "",
+			db:   "preview_abc",
+			want: "dbname=preview_abc",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, joinDBName(tc.base, tc.db))
+		})
+	}
+}
+
+// TestJoinDBName_RoundTripsThroughExtractDBName is the direct regression
+// test for the DSN-corruption bug: for both URI and keyword=value source
+// DSNs, whatever defaultClone builds via baseConnStr+joinDBName must be
+// recoverable by extractDBName the way defaultDrop needs it to be, or the
+// preview database silently leaks on cleanup.
+func TestJoinDBName_RoundTripsThroughExtractDBName(t *testing.T) {
+	cases := []string{
+		"scheme://localhost:5432/production",
+		"host=localhost port=5432 user=pg dbname=production",
+	}
+	for _, sourceDSN := range cases {
+		base := baseConnStr(sourceDSN)
+		target := joinDBName(base, "preview_xyz")
+		assert.Equal(t, "preview_xyz", extractDBName(target),
+			"dbname must round-trip for source DSN %q (base=%q, target=%q)", sourceDSN, base, target)
+	}
+}
+
+// ── marshalAnonymizationConfig ──────────────────────────────────────────────
+//
+// Regression test: defaultApplyAnonymization used to ignore input.Rules
+// entirely and run pgstream snapshot mode as a bare passthrough, even though
+// callers treat it as a "MUST succeed before expose" PII-scrubbing gate.
+
+func TestMarshalAnonymizationConfig(t *testing.T) {
+	rules := []types.AnonymizationRule{
+		{Table: "users", Column: "email", Transformer: "email"},
+		{Table: "users", Column: "name", Transformer: "name"},
+	}
+	data, err := marshalAnonymizationConfig(rules)
+	require.NoError(t, err)
+
+	var decoded struct {
+		Transformers []types.AnonymizationRule `json:"transformers"`
+	}
+	require.NoError(t, json.Unmarshal(data, &decoded))
+	require.Len(t, decoded.Transformers, 2)
+	assert.Equal(t, "users", decoded.Transformers[0].Table)
+	assert.Equal(t, "email", decoded.Transformers[0].Column)
+	assert.Equal(t, "email", decoded.Transformers[0].Transformer)
 }

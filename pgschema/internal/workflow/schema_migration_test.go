@@ -159,12 +159,12 @@ func (s *SchemaMigrationTestSuite) TestValidationFailure() {
 
 	s.env.ExecuteWorkflow(SchemaMigrationWorkflow, defaultInput())
 	s.True(s.env.IsWorkflowCompleted())
-	// Workflow returns an error (the cause), not nil.
-	s.Error(s.env.GetWorkflowError())
-
-	var result types.ProgressResponse
-	_ = s.env.GetWorkflowResult(&result)
-	s.Equal("rolled_back", result.Status)
+	// Workflow returns an error (the cause), not nil — and per Temporal
+	// semantics an errored workflow completion has no decoded result value,
+	// so we assert on the error itself rather than GetWorkflowResult.
+	err := s.env.GetWorkflowError()
+	s.Error(err)
+	s.Contains(err.Error(), "validate", "error must identify the failing phase")
 }
 
 // ── StartFailure ──────────────────────────────────────────────────────────────
@@ -296,9 +296,9 @@ func (s *SchemaMigrationTestSuite) TestUpdateHandler_ExtendWait_Valid() {
 	fake := newFakeMigration()
 	fake.register(s.env)
 
+	var updateResult string
+	var updateErr error
 	s.env.RegisterDelayedCallback(func() {
-		var updateResult string
-		var updateErr error
 		uc := &testsuite.TestUpdateCallback{
 			OnAccept: func() {},
 			OnReject: func(err error) { updateErr = err },
@@ -310,34 +310,92 @@ func (s *SchemaMigrationTestSuite) TestUpdateHandler_ExtendWait_Valid() {
 			},
 		}
 		s.env.UpdateWorkflow("extend-wait", "", uc, 30)
+	}, 1*time.Millisecond)
+
+	// The update's own handler invocation is queued as a callback and is only
+	// drained *after* the callback above returns, so assertions on the
+	// outcome — and the app-ready signal that follows — must happen later.
+	s.env.RegisterDelayedCallback(func() {
 		s.NoError(updateErr)
 		s.Contains(updateResult, "minutes")
 
 		// Then send app-ready to complete the workflow.
 		s.env.SignalWorkflow(SignalAppReady, nil)
-	}, 1*time.Millisecond)
+	}, 2*time.Millisecond)
 
 	s.env.ExecuteWorkflow(SchemaMigrationWorkflow, defaultInput())
 	s.True(s.env.IsWorkflowCompleted())
 	s.NoError(s.env.GetWorkflowError())
 }
 
+// TestUpdateHandler_ExtendWait_ActuallyDelaysRollback is the direct
+// regression test for the extend-wait fix: previously the handler validated
+// input and returned a success message but never touched the fixed
+// 60-minute waitTimeout, so the migration would still time out and roll back
+// on the original schedule regardless of how many times extend-wait was
+// called. This asserts the workflow is still running well past the original
+// 60-minute deadline once an extension has been granted, and only completes
+// after app-ready arrives inside the extended window.
+func (s *SchemaMigrationTestSuite) TestUpdateHandler_ExtendWait_ActuallyDelaysRollback() {
+	fake := newFakeMigration()
+	fake.register(s.env)
+
+	var updateErr error
+	s.env.RegisterDelayedCallback(func() {
+		uc := &testsuite.TestUpdateCallback{
+			OnAccept:   func() {},
+			OnReject:   func(err error) { updateErr = err },
+			OnComplete: func(_ interface{}, err error) { updateErr = err },
+		}
+		s.env.UpdateWorkflow("extend-wait", "", uc, 40)
+	}, 1*time.Millisecond)
+
+	s.env.RegisterDelayedCallback(func() {
+		s.NoError(updateErr, "extend-wait must be accepted")
+	}, 2*time.Millisecond)
+
+	// Past the original 60-minute deadline but well before the 100-minute
+	// (60 + 40) extended deadline: the workflow must still be running.
+	s.env.RegisterDelayedCallback(func() {
+		s.False(s.env.IsWorkflowCompleted(),
+			"extend-wait must actually push out the app-ready deadline, not just say it did")
+	}, 65*time.Minute)
+
+	// Signal app-ready comfortably inside the extended window.
+	s.env.RegisterDelayedCallback(func() {
+		s.env.SignalWorkflow(SignalAppReady, nil)
+	}, 90*time.Minute)
+
+	s.env.ExecuteWorkflow(SchemaMigrationWorkflow, defaultInput())
+	s.True(s.env.IsWorkflowCompleted())
+	s.NoError(s.env.GetWorkflowError())
+
+	var result types.ProgressResponse
+	s.NoError(s.env.GetWorkflowResult(&result))
+	s.Equal("completed", result.Status, "workflow should complete normally, not roll back")
+}
+
 func (s *SchemaMigrationTestSuite) TestUpdateHandler_ExtendWait_Invalid() {
 	fake := newFakeMigration()
 	fake.register(s.env)
 
+	var rejected bool
 	s.env.RegisterDelayedCallback(func() {
-		var rejected bool
 		uc := &testsuite.TestUpdateCallback{
 			OnAccept: func() { s.Fail("should not accept invalid input") },
 			OnReject: func(err error) { rejected = true; s.Error(err) },
 			OnComplete: func(_ interface{}, _ error) {},
 		}
 		s.env.UpdateWorkflow("extend-wait", "", uc, -5)
-		s.True(rejected, "validator must reject negative values")
-
-		s.env.SignalWorkflow(SignalAppReady, nil)
 	}, 1*time.Millisecond)
+
+	// The update's own handler invocation is queued as a callback and is only
+	// drained *after* the RegisterDelayedCallback above returns, so assertions
+	// on the callback outcome must happen in a subsequent callback.
+	s.env.RegisterDelayedCallback(func() {
+		s.True(rejected, "validator must reject negative values")
+		s.env.SignalWorkflow(SignalAppReady, nil)
+	}, 2*time.Millisecond)
 
 	s.env.ExecuteWorkflow(SchemaMigrationWorkflow, defaultInput())
 	s.True(s.env.IsWorkflowCompleted())

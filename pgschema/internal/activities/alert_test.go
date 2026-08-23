@@ -2,7 +2,10 @@ package activities
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -92,6 +95,50 @@ func TestPage_Failure_ReturnsError(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "alert page failed")
+}
+
+// ── DefaultWebhookURL fallback ──────────────────────────────────────────────
+//
+// Regression test: every real caller (pageOperator in the workflow package)
+// builds AlertMessage without ever setting WebhookURL, and defaultPage used
+// to silently no-op whenever WebhookURL was empty — meaning no operator
+// paging ever actually happened in production, despite doc comments claiming
+// critical-failure escalation. This exercises the real (non-overridden)
+// defaultPage implementation via a configured DefaultWebhookURL fallback.
+
+func TestPage_DefaultWebhookURL_UsedWhenMessageEmpty(t *testing.T) {
+	var receivedBody types.AlertMessage
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&receivedBody))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	a := NewAlertActivities(newTestLogger())
+	a.DefaultWebhookURL = srv.URL
+
+	env := newActEnv(t)
+	env.RegisterActivity(a.Page)
+	_, err := env.ExecuteActivity(a.Page, types.AlertMessage{
+		WorkflowID: "wf-default-webhook",
+		Severity:   "critical",
+		Title:      "no WebhookURL set on the message itself",
+		// WebhookURL deliberately left empty — this is exactly what every
+		// real pageOperator call site does today.
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "wf-default-webhook", receivedBody.WorkflowID,
+		"the default webhook must actually receive the POST when the message has no WebhookURL")
+}
+
+func TestPage_NoWebhookAnywhere_StillDropsCleanly(t *testing.T) {
+	a := NewAlertActivities(newTestLogger())
+	// DefaultWebhookURL left unset too — must still not error.
+
+	env := newActEnv(t)
+	env.RegisterActivity(a.Page)
+	_, err := env.ExecuteActivity(a.Page, types.AlertMessage{WorkflowID: "wf-1", Title: "t"})
+	require.NoError(t, err)
 }
 
 func TestPage_CriticalSeverity(t *testing.T) {

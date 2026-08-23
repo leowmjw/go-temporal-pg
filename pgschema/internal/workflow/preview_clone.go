@@ -54,14 +54,22 @@ func PreviewCloneWorkflow(ctx workflow.Context, input types.PreviewCloneInput) (
 		return nil, fmt.Errorf("register query handler: %w", err)
 	}
 
+	// extendTTLCh carries extension durations from the "extend-ttl" Update
+	// handler into the Step-5 wait loop below, which is the only place that
+	// actually owns the TTL deadline that controls DropPreviewDatabase.
+	extendTTLCh := workflow.NewBufferedChannel(ctx, 16)
+
 	// ── Update handler: operator extends TTL ─────────────────────────────────
 	if err := workflow.SetUpdateHandlerWithOptions(ctx,
 		"extend-ttl",
-		func(_ workflow.Context, extra time.Duration) (string, error) {
+		func(uCtx workflow.Context, extra time.Duration) (string, error) {
 			input.TTL += extra
 			if endpoint != nil {
 				endpoint.ExpiresAt = endpoint.ExpiresAt.Add(extra)
 			}
+			// Deliver the extension to the Step-5 wait loop so the actual
+			// cleanup deadline moves, not just the query-visible ExpiresAt.
+			extendTTLCh.Send(uCtx, extra)
 			return fmt.Sprintf("TTL extended by %s", extra), nil
 		},
 		workflow.UpdateHandlerOptions{
@@ -138,17 +146,35 @@ func PreviewCloneWorkflow(ctx workflow.Context, input types.PreviewCloneInput) (
 
 	// ── Step 5: Wait for cleanup signal or TTL ────────────────────────────────
 	cleanupCh := workflow.GetSignalChannel(ctx, SignalCleanup)
-	ttlTimer := workflow.NewTimer(ctx, input.TTL)
+	ttlDeadline := workflow.Now(ctx).Add(input.TTL)
 
-	sel := workflow.NewSelector(ctx)
-	sel.AddReceive(cleanupCh, func(c workflow.ReceiveChannel, _ bool) {
-		c.Receive(ctx, nil)
-		logger.Info("cleanup signal received", slog.String("preview_id", input.PreviewID))
-	})
-	sel.AddFuture(ttlTimer, func(_ workflow.Future) {
-		logger.Info("TTL expired, cleaning up", slog.String("preview_id", input.PreviewID))
-	})
-	sel.Select(ctx)
+	var cleanupRequested, ttlExpired bool
+	for !cleanupRequested && !ttlExpired {
+		remaining := ttlDeadline.Sub(workflow.Now(ctx))
+		if remaining < 0 {
+			remaining = 0
+		}
+		ttlTimer := workflow.NewTimer(ctx, remaining)
+		sel := workflow.NewSelector(ctx)
+		sel.AddReceive(cleanupCh, func(c workflow.ReceiveChannel, _ bool) {
+			c.Receive(ctx, nil)
+			cleanupRequested = true
+			logger.Info("cleanup signal received", slog.String("preview_id", input.PreviewID))
+		})
+		sel.AddFuture(ttlTimer, func(_ workflow.Future) {
+			ttlExpired = true
+			logger.Info("TTL expired, cleaning up", slog.String("preview_id", input.PreviewID))
+		})
+		sel.AddReceive(extendTTLCh, func(c workflow.ReceiveChannel, _ bool) {
+			var extra time.Duration
+			c.Receive(ctx, &extra)
+			ttlDeadline = ttlDeadline.Add(extra)
+			logger.Info("preview TTL deadline extended",
+				slog.String("preview_id", input.PreviewID),
+				slog.Time("new_deadline", ttlDeadline))
+		})
+		sel.Select(ctx)
+	}
 
 	// ── Step 6: Drop ──────────────────────────────────────────────────────────
 	dropOpts := workflow.ActivityOptions{

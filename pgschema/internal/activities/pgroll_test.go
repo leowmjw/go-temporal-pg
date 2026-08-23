@@ -270,6 +270,21 @@ func TestRedactDSN(t *testing.T) {
 	}
 }
 
+// TestRedactDSN_QuotedPasswordWithSpace is the direct regression test for the
+// whitespace-leak bug: redactDSN used to find the mask's end via
+// strings.IndexAny(rest, " \t"), which stops at the FIRST space it finds —
+// including one inside a single-quoted password value (libpq allows
+// password='a b c' so the value itself can contain spaces). That truncated
+// mask boundary let the tail of the real password leak into the "redacted"
+// output after the "******".
+func TestRedactDSN_QuotedPasswordWithSpace(t *testing.T) {
+	got := redactDSN("host=localhost password='s3cr3t with spaces' user=pg")
+	assert.NotContains(t, got, "with spaces", "no part of the quoted password may leak")
+	assert.NotContains(t, got, "s3cr3t")
+	assert.Contains(t, got, "user=pg", "fields after the password must be preserved")
+	assert.Contains(t, got, "******")
+}
+
 // ── synctest: concurrent heartbeat emission ────────────────────────────────────
 // Scenario: verify that when the activity's start function runs inside a
 // synctest bubble, both "starting" and "started" heartbeats are emitted before

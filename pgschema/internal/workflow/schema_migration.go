@@ -69,17 +69,26 @@ func SchemaMigrationWorkflow(ctx workflow.Context, input types.MigrationInput) (
 		return nil, fmt.Errorf("register query handler: %w", err)
 	}
 
+	// extendWaitCh carries extension amounts (in minutes) from the "extend-wait"
+	// Update handler into the Step-3 wait loop below, which is the only place
+	// that actually owns the app-ready deadline.  Buffered so a call arriving
+	// before Step 3 begins (e.g. during validate/start) is not lost.
+	extendWaitCh := workflow.NewBufferedChannel(ctx, 16)
+
 	// ── Update handler (SDK v1.22+) — operator can bump TTL mid-flight ───────
 	// Only registered for workflow runs that include this version.
 	if v >= versionAddUpdate {
 		if err := workflow.SetUpdateHandlerWithOptions(ctx,
 			"extend-wait",
-			func(ctx workflow.Context, extraMinutes int) (string, error) {
+			func(uCtx workflow.Context, extraMinutes int) (string, error) {
 				if extraMinutes <= 0 {
 					return "", errors.New("extraMinutes must be > 0")
 				}
 				logger.Info("extending app-ready wait",
 					slog.Int("extra_minutes", extraMinutes))
+				// Deliver the extension to the Step-3 wait loop so the actual
+				// deadline moves, not just this handler's return value.
+				extendWaitCh.Send(uCtx, extraMinutes)
 				return fmt.Sprintf("wait extended by %d minutes", extraMinutes), nil
 			},
 			workflow.UpdateHandlerOptions{
@@ -111,9 +120,6 @@ func SchemaMigrationWorkflow(ctx workflow.Context, input types.MigrationInput) (
 	}
 	ctx = workflow.WithActivityOptions(ctx, actOpts)
 
-	var act *activities.PgrollActivities // registered on worker; called by name
-	_ = act
-
 	// checkRollback drains the rollback channel non-blockingly.
 	checkRollback := func() bool {
 		var sig string
@@ -143,19 +149,45 @@ func SchemaMigrationWorkflow(ctx workflow.Context, input types.MigrationInput) (
 
 	// ── Step 3: Wait for app-ready signal (or timeout + rollback) ────────────
 	progress.Phase, progress.Percent = "waiting_for_app_ready", 40
-	waitTimeout := workflow.NewTimer(ctx, 60*time.Minute)
-	sel := workflow.NewSelector(ctx)
 
-	var appReadyReceived bool
-	sel.AddReceive(appReadyCh, func(c workflow.ReceiveChannel, _ bool) {
-		c.Receive(ctx, nil)
-		appReadyReceived = true
-	})
-	sel.AddFuture(waitTimeout, func(_ workflow.Future) {})
-	sel.AddReceive(rollbackCh, func(c workflow.ReceiveChannel, _ bool) {
-		c.Receive(ctx, nil)
-	})
-	sel.Select(ctx)
+	const initialAppReadyWait = 60 * time.Minute
+	waitDeadline := workflow.Now(ctx).Add(initialAppReadyWait)
+
+	// timedOut is distinct from "loop condition false because of app-ready or
+	// rollback" — it's what actually ends the loop when the deadline is
+	// reached with no extension pending. Without it, a plain timeout would
+	// leave every loop-condition flag false and spin forever recreating
+	// zero-duration timers instead of ever falling through to rollback.
+	var appReadyReceived, rollbackRequested, timedOut bool
+	for !appReadyReceived && !rollbackRequested && !timedOut {
+		remaining := waitDeadline.Sub(workflow.Now(ctx))
+		if remaining < 0 {
+			remaining = 0
+		}
+		waitTimeout := workflow.NewTimer(ctx, remaining)
+		sel := workflow.NewSelector(ctx)
+
+		sel.AddReceive(appReadyCh, func(c workflow.ReceiveChannel, _ bool) {
+			c.Receive(ctx, nil)
+			appReadyReceived = true
+		})
+		sel.AddFuture(waitTimeout, func(_ workflow.Future) {
+			timedOut = true
+		})
+		sel.AddReceive(rollbackCh, func(c workflow.ReceiveChannel, _ bool) {
+			c.Receive(ctx, nil)
+			rollbackRequested = true
+		})
+		sel.AddReceive(extendWaitCh, func(c workflow.ReceiveChannel, _ bool) {
+			var extraMinutes int
+			c.Receive(ctx, &extraMinutes)
+			waitDeadline = waitDeadline.Add(time.Duration(extraMinutes) * time.Minute)
+			logger.Info("app-ready wait deadline extended",
+				slog.Int("extra_minutes", extraMinutes),
+				slog.Time("new_deadline", waitDeadline))
+		})
+		sel.Select(ctx)
+	}
 
 	if !appReadyReceived {
 		// Timed out or rollback signal — compensate.
