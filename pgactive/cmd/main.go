@@ -13,7 +13,7 @@ import (
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
 
-	"github.com/leowmjw/go-temporal-pg/pgactive/internal/activities"
+	activitiespkg "github.com/leowmjw/go-temporal-pg/pgactive/internal/activities"
 	"github.com/leowmjw/go-temporal-pg/pgactive/internal/workflow"
 )
 
@@ -63,7 +63,7 @@ func main() {
 	w.RegisterWorkflow(workflow.RollingUpgradeWorkflow)
 
 	// Register activities
-	activities := activities.NewActivities(rdsClient, secretsClient, logger)
+	activities := activitiespkg.NewActivities(activitiespkg.NewRDSClientFuncs(rdsClient), secretsClient, logger)
 	w.RegisterActivity(activities.ValidateInput)
 	w.RegisterActivity(activities.ProvisionTargetDB)
 	w.RegisterActivity(activities.ConfigurePgactiveParams)
