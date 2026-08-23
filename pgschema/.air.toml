@@ -1,0 +1,31 @@
+root = "."
+tmp_dir = "tmp"
+
+[build]
+cmd = "go build -o ./tmp/pgschema-dev ./cmd/pgschema"
+bin = "./tmp/pgschema-dev"
+include_ext = ["go", "json"]
+exclude_dir = ["tmp", "bin", "test"]
+exclude_regex = ["_test\\.go$"]
+delay = 200
+# send_interrupt: on rebuild AND on air's own shutdown (air treats SIGINT and
+# SIGTERM alike — overmind's default stop signal is SIGTERM), send SIGINT to
+# the running pgschema-dev binary first instead of jumping straight to
+# kill_delay's hard kill, so main.go's worker.InterruptCh() path runs and the
+# three Temporal workers stop cleanly rather than being killed mid-poll.
+send_interrupt = true
+kill_delay = "2s"
+stop_on_error = true
+
+[log]
+time = true
+
+[color]
+main = "cyan"
+build = "yellow"
+runner = "green"
+
+[misc]
+# Remove tmp_dir (the built pgschema-dev binary) when air itself exits, so a
+# stopped `mise run dev` doesn't leave a stale binary behind in tmp/.
+clean_on_exit = true

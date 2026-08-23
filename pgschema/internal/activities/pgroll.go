@@ -3,12 +3,10 @@
 package activities
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os/exec"
 
 	"github.com/leowmjw/go-temporal-pg/pgschema/internal/types"
 )
@@ -111,15 +109,12 @@ func (a *PgrollActivities) defaultRollback(ctx context.Context, input types.Migr
 }
 
 func (a *PgrollActivities) defaultStatus(ctx context.Context, input types.MigrationInput) (*types.MigrationStatus, error) {
-	var stdout bytes.Buffer
-	args := []string{"--dsn", input.DSN, "--schema", input.Schema, "status", "--output", "json"}
-	cmd := exec.CommandContext(ctx, "pgroll", args...)
-	cmd.Stdout = &stdout
-	if err := cmd.Run(); err != nil {
+	out, err := a.runPgrollOutput(ctx, input.DSN, input.Schema, []string{"status"})
+	if err != nil {
 		return nil, fmt.Errorf("pgroll status: %w", err)
 	}
 	var s types.MigrationStatus
-	if err := json.Unmarshal(stdout.Bytes(), &s); err != nil {
+	if err := json.Unmarshal(out, &s); err != nil {
 		return nil, fmt.Errorf("parsing pgroll status output: %w", err)
 	}
 	return &s, nil

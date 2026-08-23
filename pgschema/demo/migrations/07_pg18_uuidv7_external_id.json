@@ -1,0 +1,16 @@
+{
+  "operations": [
+    {
+      "add_column": {
+        "table": "users",
+        "up": "uuidv7()",
+        "column": {
+          "name": "external_id",
+          "type": "uuid",
+          "nullable": false,
+          "default": "uuidv7()"
+        }
+      }
+    }
+  ]
+}

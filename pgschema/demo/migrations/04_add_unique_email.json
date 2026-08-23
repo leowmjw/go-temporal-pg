@@ -1,0 +1,15 @@
+{
+  "operations": [
+    {
+      "alter_column": {
+        "table": "users",
+        "column": "email",
+        "up": "email",
+        "down": "email",
+        "unique": {
+          "name": "users_email_unique"
+        }
+      }
+    }
+  ]
+}

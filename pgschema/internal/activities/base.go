@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -113,15 +114,11 @@ func workflowAttrs(ctx context.Context) (attrs []slog.Attr) {
 
 // cmdConfig configures a single runCommand call.
 type cmdConfig struct {
-	stdin        string
 	stdoutOnly   bool   // use cmd.Output() (stdout only) instead of cmd.CombinedOutput()
 	heartbeatMsg string // non-empty: run via Start/Wait, heartbeating this message every 30s while it blocks
 }
 
 type cmdOption func(*cmdConfig)
-
-// withStdin pipes s to the command's stdin.
-func withStdin(s string) cmdOption { return func(c *cmdConfig) { c.stdin = s } }
 
 // withStdoutOnly captures only stdout (used for `--output json` commands
 // where stderr noise would break JSON parsing).
@@ -149,9 +146,6 @@ func (b baseActivities) runCommand(ctx context.Context, name string, args []stri
 	end := b.startTrace(ctx, "exec."+name, slog.String("args", strings.Join(redactArgs(args), " ")))
 
 	cmd := exec.CommandContext(ctx, name, args...)
-	if cfg.stdin != "" {
-		cmd.Stdin = strings.NewReader(cfg.stdin)
-	}
 
 	var out []byte
 	var err error
@@ -215,17 +209,43 @@ func redactArgs(args []string) []string {
 
 // ─── pgroll / pgstream CLI helpers shared across Activities structs ───────
 
-// runPgroll invokes the pgroll CLI; migrationJSON is piped on stdin when
-// non-empty. Shared by PgrollActivities and PreviewDBActivities (migration
-// preview).
+// runPgroll invokes the pgroll CLI. When migrationJSON is non-empty it is
+// written to a temp file and passed as the trailing positional <file>
+// argument that `validate`/`start` require (pgroll v0.16.2 does not accept
+// the migration on stdin — confirmed against the real binary; see
+// AGENT.md). The flag is `--postgres-url`, not `--dsn` — also confirmed
+// against `pgroll --help`, since v0.16.2 renamed/never had a `--dsn` flag.
+// Shared by PgrollActivities and PreviewDBActivities (migration preview).
 func (b baseActivities) runPgroll(ctx context.Context, dsn, schema string, args []string, migrationJSON string) error {
-	full := append([]string{"--dsn", dsn, "--schema", schema}, args...)
-	opts := []cmdOption{}
+	full := append([]string{"--postgres-url", dsn, "--schema", schema}, args...)
+
 	if migrationJSON != "" {
-		opts = append(opts, withStdin(migrationJSON))
+		f, err := os.CreateTemp("", "pgroll-migration-*.json")
+		if err != nil {
+			return fmt.Errorf("write migration file: %w", err)
+		}
+		defer os.Remove(f.Name())
+		if _, err := f.WriteString(migrationJSON); err != nil {
+			f.Close()
+			return fmt.Errorf("write migration file: %w", err)
+		}
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("write migration file: %w", err)
+		}
+		full = append(full, f.Name())
 	}
-	_, err := b.runCommand(ctx, "pgroll", full, opts...)
+
+	_, err := b.runCommand(ctx, "pgroll", full)
 	return err
+}
+
+// runPgrollOutput invokes pgroll and returns stdout only, for subcommands
+// like `status` that print JSON to stdout with no dedicated output flag
+// (pgroll v0.16.2's `status` has no `--output`/`--json` flag — it always
+// prints JSON).
+func (b baseActivities) runPgrollOutput(ctx context.Context, dsn, schema string, args []string) ([]byte, error) {
+	full := append([]string{"--postgres-url", dsn, "--schema", schema}, args...)
+	return b.runCommand(ctx, "pgroll", full, withStdoutOnly())
 }
 
 // runPgroll status is handled separately (defaultStatus) because it needs

@@ -30,7 +30,10 @@ func main() {
 	))
 	slog.SetDefault(log)
 
-	c, err := client.Dial(client.Options{})
+	c, err := client.Dial(client.Options{
+		HostPort:  os.Getenv("TEMPORAL_ADDRESS"), // "" keeps the SDK default (127.0.0.1:7233)
+		Namespace: os.Getenv("TEMPORAL_NAMESPACE"),
+	})
 	if err != nil {
 		log.Error("failed to connect to Temporal", slog.String("error", err.Error()))
 		os.Exit(1)

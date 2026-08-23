@@ -1,19 +1,91 @@
 # pgschema/mise.toml — tool versions and task definitions for the pgschema module.
 # Run tasks with: mise run <task>
+#
+# `temporal` (the Temporal CLI, providing `temporal server start-dev`) is
+# assumed to already be installed standalone on PATH — it is intentionally
+# not managed here. `mise run doctor` checks for it along with pgroll/
+# pgstream/air/overmind.
+
+# [env] loads pgschema/.env (see .env.sample) into every `mise run <task>`
+# and into `mise exec`/any mise-activated shell, so PGROLL_DSN, TEMPORAL_
+# ADDRESS, etc. don't need to be exported by hand. `.env` is gitignored.
+#
+# _.path prepends ~/go/bin so `mise run install-tools` output (pgroll,
+# pgstream — installed via `go install`, which drops binaries in GOBIN /
+# $(go env GOPATH)/bin, i.e. ~/go/bin by default) is on PATH for every mise
+# task and mise-activated shell without depending on the user's own shell
+# rc files to have set it up.
+[env]
+_.file = ".env"
+_.path = ["{{env.HOME}}/go/bin"]
 
 [tools]
+air = "latest"
 go = "1.27.0"
+overmind = "latest"
 # pgroll: zero-downtime schema migrations for PostgreSQL
 # Installed via go install so it's in GOPATH/bin
 # pgroll = "0.16.2"   # uncomment if mise has a pgroll plugin
 # pgstream: CDC / anonymization pipeline for PostgreSQL
 # pgstream = "1.4.1"  # uncomment if mise has a pgstream plugin
 
+[tasks.doctor]
+description = "Check that all dev dependencies (mise-managed and standalone) are present"
+run = """
+set -e
+ok() { echo "  OK   $1  ($(command -v "$1"))"; }
+missing() { echo "  MISSING  $1  — $2"; }
+
+echo "pgschema doctor"
+echo "───────────────"
+
+for bin in air overmind go; do
+  if command -v "$bin" >/dev/null 2>&1; then ok "$bin"; else missing "$bin" "run: mise install"; fi
+done
+
+if command -v temporal >/dev/null 2>&1; then
+  ok "temporal"
+else
+  missing "temporal" "standalone install expected, see https://docs.temporal.io/cli"
+fi
+
+if command -v docker >/dev/null 2>&1; then
+  ok "docker"
+else
+  missing "docker" "needed for the demo Postgres — see https://docs.docker.com/get-docker/"
+fi
+
+for bin in pgroll pgstream; do
+  if command -v "$bin" >/dev/null 2>&1; then ok "$bin"; else missing "$bin" "run: mise run install-tools"; fi
+done
+
+if [ -f .env ]; then
+  echo "  OK   .env  (present)"
+else
+  echo "  MISSING  .env  — run: cp .env.sample .env"
+fi
+
+echo "───────────────"
+echo "done"
+"""
+
+[tasks.dev]
+description = "Run demo postgres + temporal dev server + the auto-reloading worker + demo web UI together (requires overmind, air, temporal, docker)"
+# --timeout: seconds overmind gives each process to shut down gracefully
+# (SIGTERM, then its trap/air's send_interrupt path) before SIGKILLing it.
+# The default (5s) is tight for `docker compose down` (Procfile's postgres
+# line) to actually stop the container and remove the network cleanly —
+# bumped so `mise run dev` + Ctrl-C reliably leaves nothing running behind,
+# instead of occasionally SIGKILLing docker mid-teardown.
+run = "overmind start -f Procfile --timeout 15"
+
 [tasks.install-tools]
 description = "Install pgroll and pgstream binaries"
 run = [
-  "go install github.com/xataio/pgroll/cmd/pgroll@v0.16.2",
-  "go install github.com/xataio/pgstream/cmd/pgstream@v1.4.1",
+  # Both modules put main() at the module root, not cmd/<name> — the
+  # cmd/<name> subpackage path 404s ("found, but does not contain package").
+  "go install github.com/xataio/pgroll@v0.16.2",
+  "go install github.com/xataio/pgstream@v1.4.1",
 ]
 
 [tasks.fmt]
@@ -40,17 +112,63 @@ run = "go build -o bin/pgschema ./cmd/pgschema"
 description = "Format, vet, test, and build"
 depends = ["fmt", "vet", "test", "build"]
 
+# ─── Demo: pgroll workflow showcase ─────────────────────────────────────────
+# See demo/README.md for the full walkthrough. Quick start:
+#   mise run demo-reset   # fresh demo Postgres + pgroll init
+#   mise run dev          # postgres + temporal + worker + demo web UI, all together
+# then open http://localhost:8090 and click through the 5 scenarios.
+
+[tasks.demo-up]
+description = "Start the demo Postgres (docker compose) and wait until healthy"
+run = "docker compose -f demo/docker-compose.yml up -d --wait"
+
+[tasks.demo-down]
+description = "Stop the demo Postgres and delete its volume (all demo data is throwaway)"
+run = "docker compose -f demo/docker-compose.yml down -v"
+
+[tasks.demo-init]
+description = "pgroll init + baseline against the demo database (requires demo-up first, and pgroll on PATH)"
+run = """
+set -e
+DSN="${PGROLL_DSN:-postgres://postgres:postgres@localhost:5432/pgschema_demo?sslmode=disable}"
+# demo/init/001_seed_users.sql creates the `users` table with plain SQL
+# (brownfield, pre-pgroll) — pgroll refuses to touch a non-empty schema it
+# doesn't recognize until a baseline is recorded for it. `baseline` also
+# writes a placeholder migration file into the target dir for the operator
+# to fill in from `pg_dump` later; we don't need its content for the demo,
+# just the state it records, so it's written to the gitignored .data/ dir.
+mkdir -p .data/pgroll-baseline
+pgroll --postgres-url "$DSN" --schema "${SCHEMA:-public}" init
+pgroll --postgres-url "$DSN" --schema "${SCHEMA:-public}" baseline 00_baseline .data/pgroll-baseline -y
+"""
+
+[tasks.demo-reset]
+description = "Recreate the demo database from scratch and run pgroll init"
+depends = ["demo-down"]
+run = ["mise run demo-up", "mise run demo-init"]
+
+[tasks.demo-build]
+description = "Build the demo web UI binary"
+run = "go build -o bin/pgschema-demo ./cmd/pgschema-demo"
+
+[tasks.demo-web]
+description = "Run the demo web UI once (no reload; use `mise run dev` for the reloading version)"
+run = "go run ./cmd/pgschema-demo"
+
 [tasks.migrate-start]
 description = "Start a pgroll migration (set PGROLL_DSN and MIGRATION_FILE env vars)"
-run = "pgroll --dsn $PGROLL_DSN --schema ${SCHEMA:-public} start < $MIGRATION_FILE"
+# pgroll v0.16.2 takes the migration file as a positional <file> argument,
+# not on stdin, and its DSN flag is --postgres-url, not --dsn (verified
+# against the real binary — see AGENT.md).
+run = "pgroll --postgres-url $PGROLL_DSN --schema ${SCHEMA:-public} start $MIGRATION_FILE"
 
 [tasks.migrate-complete]
 description = "Complete the active pgroll migration"
-run = "pgroll --dsn $PGROLL_DSN --schema ${SCHEMA:-public} complete"
+run = "pgroll --postgres-url $PGROLL_DSN --schema ${SCHEMA:-public} complete"
 
 [tasks.migrate-rollback]
 description = "Roll back the active pgroll migration"
-run = "pgroll --dsn $PGROLL_DSN --schema ${SCHEMA:-public} rollback"
+run = "pgroll --postgres-url $PGROLL_DSN --schema ${SCHEMA:-public} rollback"
 
 [tasks.stream-start]
 description = "Start a pgstream CDC pipeline (set SOURCE_DSN and TARGET_DSN)"

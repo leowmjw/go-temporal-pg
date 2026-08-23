@@ -1,0 +1,14 @@
+{
+  "operations": [
+    {
+      "add_column": {
+        "table": "users",
+        "column": {
+          "name": "email",
+          "type": "varchar(255)",
+          "nullable": true
+        }
+      }
+    }
+  ]
+}
