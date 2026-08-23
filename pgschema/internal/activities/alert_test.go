@@ -37,7 +37,7 @@ import (
 func TestPage_Success(t *testing.T) {
 	var received types.AlertMessage
 	a := &AlertActivities{
-		log: newTestLogger(),
+		baseActivities: baseActivities{log: newTestLogger()},
 		PageFn: func(_ context.Context, msg types.AlertMessage) error {
 			received = msg
 			return nil
@@ -64,7 +64,7 @@ func TestPage_NoWebhook_Drops(t *testing.T) {
 	// PageFn should NOT be called when WebhookURL is empty in the default impl.
 	// Here we confirm the activity returns nil even with an empty URL.
 	a := &AlertActivities{
-		log: newTestLogger(),
+		baseActivities: baseActivities{log: newTestLogger()},
 		PageFn: func(_ context.Context, _ types.AlertMessage) error {
 			return nil // default noop when no URL
 		},
@@ -82,7 +82,7 @@ func TestPage_NoWebhook_Drops(t *testing.T) {
 
 func TestPage_Failure_ReturnsError(t *testing.T) {
 	a := &AlertActivities{
-		log: newTestLogger(),
+		baseActivities: baseActivities{log: newTestLogger()},
 		PageFn: func(_ context.Context, _ types.AlertMessage) error {
 			return errors.New("webhook returned HTTP 503")
 		},
@@ -144,7 +144,7 @@ func TestPage_NoWebhookAnywhere_StillDropsCleanly(t *testing.T) {
 func TestPage_CriticalSeverity(t *testing.T) {
 	var gotSeverity string
 	a := &AlertActivities{
-		log: newTestLogger(),
+		baseActivities: baseActivities{log: newTestLogger()},
 		PageFn: func(_ context.Context, msg types.AlertMessage) error {
 			gotSeverity = msg.Severity
 			return nil

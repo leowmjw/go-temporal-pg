@@ -9,8 +9,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
-	"strings"
-
 
 	"github.com/leowmjw/go-temporal-pg/pgschema/internal/types"
 )
@@ -18,17 +16,17 @@ import (
 // PgrollActivities holds all pgroll-related Temporal activities.
 // Replace any function field with an anonymous function in tests.
 type PgrollActivities struct {
+	baseActivities
 	ValidateFn func(ctx context.Context, input types.MigrationInput) error
 	StartFn    func(ctx context.Context, input types.MigrationInput) error
 	CompleteFn func(ctx context.Context, input types.MigrationInput) error
 	RollbackFn func(ctx context.Context, input types.MigrationInput) error
 	StatusFn   func(ctx context.Context, input types.MigrationInput) (*types.MigrationStatus, error)
-	log        *slog.Logger
 }
 
 // NewPgrollActivities returns a PgrollActivities wired to the real pgroll binary.
 func NewPgrollActivities(log *slog.Logger) *PgrollActivities {
-	a := &PgrollActivities{log: log}
+	a := &PgrollActivities{baseActivities: baseActivities{log: log}}
 	a.ValidateFn = a.defaultValidate
 	a.StartFn = a.defaultStart
 	a.CompleteFn = a.defaultComplete
@@ -36,19 +34,13 @@ func NewPgrollActivities(log *slog.Logger) *PgrollActivities {
 	a.StatusFn = a.defaultStatus
 	return a
 }
-// logger returns the struct's logger, falling back to slog.Default() if nil.
-func (a *PgrollActivities) logger() *slog.Logger {
-	if a.log == nil {
-		return slog.Default()
-	}
-	return a.log
-}
-
 
 // ValidateMigration dry-runs the migration JSON before any DDL touches the DB.
 func (a *PgrollActivities) ValidateMigration(ctx context.Context, input types.MigrationInput) error {
-	a.logger().InfoContext(ctx, "validating migration", slog.String("schema", input.Schema))
-	if err := a.ValidateFn(ctx, input); err != nil {
+	end := a.startTrace(ctx, "pgroll.validate", slog.String("schema", input.Schema))
+	err := a.ValidateFn(ctx, input)
+	end(err)
+	if err != nil {
 		return &types.MigrationError{Phase: "validate", Wrapped: err}
 	}
 	return nil
@@ -56,30 +48,36 @@ func (a *PgrollActivities) ValidateMigration(ctx context.Context, input types.Mi
 
 // StartMigration runs pgroll start (expand phase: old+new schema coexist).
 func (a *PgrollActivities) StartMigration(ctx context.Context, input types.MigrationInput) error {
-	a.logger().InfoContext(ctx, "starting migration", slog.String("schema", input.Schema))
+	end := a.startTrace(ctx, "pgroll.start", slog.String("schema", input.Schema))
 	safeHeartbeat(ctx, "starting")
-	if err := a.StartFn(ctx, input); err != nil {
+	err := a.StartFn(ctx, input)
+	safeHeartbeat(ctx, "started")
+	end(err)
+	if err != nil {
 		return &types.MigrationError{Phase: "start", Wrapped: err}
 	}
-	safeHeartbeat(ctx, "started")
 	return nil
 }
 
 // CompleteMigration runs pgroll complete (contract phase: old schema removed).
 func (a *PgrollActivities) CompleteMigration(ctx context.Context, input types.MigrationInput) error {
-	a.logger().InfoContext(ctx, "completing migration", slog.String("schema", input.Schema))
+	end := a.startTrace(ctx, "pgroll.complete", slog.String("schema", input.Schema))
 	safeHeartbeat(ctx, "completing")
-	if err := a.CompleteFn(ctx, input); err != nil {
+	err := a.CompleteFn(ctx, input)
+	safeHeartbeat(ctx, "completed")
+	end(err)
+	if err != nil {
 		return &types.MigrationError{Phase: "complete", Wrapped: err}
 	}
-	safeHeartbeat(ctx, "completed")
 	return nil
 }
 
 // RollbackMigration reverts the expand phase.
 func (a *PgrollActivities) RollbackMigration(ctx context.Context, input types.MigrationInput) error {
-	a.logger().InfoContext(ctx, "rolling back migration", slog.String("schema", input.Schema))
-	if err := a.RollbackFn(ctx, input); err != nil {
+	end := a.startTrace(ctx, "pgroll.rollback", slog.String("schema", input.Schema))
+	err := a.RollbackFn(ctx, input)
+	end(err)
+	if err != nil {
 		return &types.MigrationError{Phase: "rollback", Wrapped: err}
 	}
 	return nil
@@ -87,7 +85,9 @@ func (a *PgrollActivities) RollbackMigration(ctx context.Context, input types.Mi
 
 // GetMigrationStatus returns the current pgroll migration state.
 func (a *PgrollActivities) GetMigrationStatus(ctx context.Context, input types.MigrationInput) (*types.MigrationStatus, error) {
+	end := a.startTrace(ctx, "pgroll.status", slog.String("schema", input.Schema))
 	status, err := a.StatusFn(ctx, input)
+	end(err)
 	if err != nil {
 		return nil, &types.MigrationError{Phase: "status", Wrapped: err}
 	}
@@ -95,19 +95,19 @@ func (a *PgrollActivities) GetMigrationStatus(ctx context.Context, input types.M
 }
 
 func (a *PgrollActivities) defaultValidate(ctx context.Context, input types.MigrationInput) error {
-	return runPgroll(ctx, input.DSN, input.Schema, []string{"validate"}, input.MigrationJSON)
+	return a.runPgroll(ctx, input.DSN, input.Schema, []string{"validate"}, input.MigrationJSON)
 }
 
 func (a *PgrollActivities) defaultStart(ctx context.Context, input types.MigrationInput) error {
-	return runPgroll(ctx, input.DSN, input.Schema, []string{"start", "--complete=false"}, input.MigrationJSON)
+	return a.runPgroll(ctx, input.DSN, input.Schema, []string{"start", "--complete=false"}, input.MigrationJSON)
 }
 
 func (a *PgrollActivities) defaultComplete(ctx context.Context, input types.MigrationInput) error {
-	return runPgroll(ctx, input.DSN, input.Schema, []string{"complete"}, "")
+	return a.runPgroll(ctx, input.DSN, input.Schema, []string{"complete"}, "")
 }
 
 func (a *PgrollActivities) defaultRollback(ctx context.Context, input types.MigrationInput) error {
-	return runPgroll(ctx, input.DSN, input.Schema, []string{"rollback"}, "")
+	return a.runPgroll(ctx, input.DSN, input.Schema, []string{"rollback"}, "")
 }
 
 func (a *PgrollActivities) defaultStatus(ctx context.Context, input types.MigrationInput) (*types.MigrationStatus, error) {
@@ -123,60 +123,4 @@ func (a *PgrollActivities) defaultStatus(ctx context.Context, input types.Migrat
 		return nil, fmt.Errorf("parsing pgroll status output: %w", err)
 	}
 	return &s, nil
-}
-
-// runPgroll invokes the pgroll CLI; migrationJSON is piped on stdin when non-empty.
-func runPgroll(ctx context.Context, dsn, schema string, args []string, migrationJSON string) error {
-	base := []string{"--dsn", dsn, "--schema", schema}
-	cmd := exec.CommandContext(ctx, "pgroll", append(base, args...)...)
-	if migrationJSON != "" {
-		cmd.Stdin = strings.NewReader(migrationJSON)
-	}
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("pgroll %s: %w — %s", strings.Join(args, " "), err, string(out))
-	}
-	return nil
-}
-
-// redactDSN masks the password field for safe logging.
-// Supports keyword=value (****** and URI (://user:pass@host) forms.
-func redactDSN(dsn string) string {
-	pwKey := " password="
-	if i := strings.Index(dsn, pwKey); i >= 0 {
-		valStart := i + len(pwKey)
-		end := valStart
-		if valStart < len(dsn) && dsn[valStart] == '\'' {
-			// Quoted value (libpq allows this so the value can contain
-			// spaces): skip to the matching, non-escaped closing quote so we
-			// don't stop redacting partway through the real password.
-			end++
-			for end < len(dsn) {
-				if dsn[end] == '\\' && end+1 < len(dsn) {
-					end += 2
-					continue
-				}
-				if dsn[end] == '\'' {
-					end++
-					break
-				}
-				end++
-			}
-		} else {
-			for end < len(dsn) && dsn[end] != ' ' && dsn[end] != '\t' {
-				end++
-			}
-		}
-		return dsn[:valStart] + "******" + dsn[end:]
-	}
-	if i := strings.Index(dsn, "://"); i >= 0 {
-		after := dsn[i+3:]
-		if atIdx := strings.Index(after, "@"); atIdx >= 0 {
-			cred := after[:atIdx]
-			if colonIdx := strings.Index(cred, ":"); colonIdx >= 0 {
-				return dsn[:i+3] + cred[:colonIdx+1] + "******" + "@" + after[atIdx+1:]
-			}
-		}
-	}
-	return dsn
 }

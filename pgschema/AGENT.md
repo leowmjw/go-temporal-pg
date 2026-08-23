@@ -253,19 +253,99 @@ into outer-scoped variables; a second, later-scheduled callback asserts on them.
 If you add a new Update-handler test, follow the same split or it will silently
 assert on empty/zero values instead of the real outcome.
 
-## Duplication that could still be consolidated (untouched, not a bug)
+## Duplication that could still be consolidated — fixed
 
-- `logger()` nil-fallback is copy-pasted identically across all 4 activity structs
-  (`AlertActivities`, `PgrollActivities`, `PgstreamActivities`, `PreviewDBActivities`).
-- DSN parsing (URI vs keyword=value) is independently reimplemented in
+All three items below are now consolidated in `internal/activities/base.go` and
+`internal/activities/dsn.go`; every activity struct embeds the shared type
+instead of reimplementing it.
+
+- `logger()` nil-fallback used to be copy-pasted identically across all 4
+  activity structs. Now `baseActivities{ log *slog.Logger }` is embedded (by
+  value) into `AlertActivities`, `PgrollActivities`, `PgstreamActivities`, and
+  `PreviewDBActivities`, and `logger()` is defined once on `baseActivities`.
+  Constructors set it via `baseActivities: baseActivities{log: log}`; test
+  literals use the same nested-struct form (see `newTestPgrollActivities` and
+  friends).
+- DSN parsing (URI vs keyword=value) was independently reimplemented in
   `redactDSN` (`pgroll.go`) and `baseConnStr`/`extractDBName`/`joinDBName`
-  (`preview_db.go`).
-- `exec.CommandContext` + wrap-error-with-output pattern is reimplemented several
-  times (`runPgroll`, `runPgstream`, `runPgstreamOutput`, `runPgstreamHeartbeating`,
-  inline in `defaultClone`/`defaultDrop`) with inconsistent error formatting.
+  (`preview_db.go`). All four now live together in `dsn.go` and share one
+  `isURIForm` classifier instead of each re-deriving the `strings.Contains(dsn,
+  "://")` check.
+- `exec.CommandContext` + wrap-error-with-output was reimplemented as
+  `runPgroll`, `runPgstream`, `runPgstreamOutput`, `runPgstreamHeartbeating`,
+  and inline calls in `defaultClone`/`defaultDrop`. All of that now goes
+  through one `baseActivities.runCommand(ctx, name, args, opts...)`, configured
+  via `withStdin`, `withStdoutOnly`, `withHeartbeat(msg)`. `runPgroll` /
+  `runPgstream` / `runPgstreamOutput` / `runPgstreamHeartbeating` still exist
+  as thin named wrappers around `runCommand` (kept because call sites read
+  better as `a.runPgroll(...)` than `a.runCommand(ctx, "pgroll", ...)`), but
+  there is now exactly one place that builds the command, captures output, and
+  formats the wrapped error. The one exception is `defaultClone`'s
+  `pg_dump | psql` pipe, which needs `StdoutPipe`/`Start`/`Wait` across two
+  processes and doesn't fit `runCommand`'s single-process shape — it stays
+  manual but is traced through the same `startTrace` helper described below.
 
-If adding a new activity type, prefer factoring a shared `baseActivities{ log }`
-and a shared `runCommand` helper rather than copying these patterns again.
+If adding a new activity type, embed `baseActivities` and use `runCommand`
+(or the `runPgroll`/`runPgstream*` wrappers) rather than reimplementing either.
+
+## Structured trace/flow logging — foundation for agentic log analysis
+
+`baseActivities.startTrace(ctx, op, attrs...)` (in `base.go`) is a small,
+tracer-shaped wrapper around `slog` that every activity method and every
+`runCommand` call now uses. It exists so an agent (or a human with `jq`) can
+reconstruct what a workflow run actually did — order, duration, success/
+failure, causal grouping — by reading the worker's structured log stream
+alone, without standing up a separate tracing backend. This is intentionally
+*not* OpenTelemetry: it's the minimum structure needed for log-based flow
+reconstruction, layered on the logging pgschema already has.
+
+Shape of each pair of log lines:
+
+```json
+{"msg":"pgroll.start","flow":"start","op":"pgroll.start","trace_id":"...","schema":"public","workflow_id":"...","run_id":"...","activity_id":"..."}
+{"msg":"pgroll.start","flow":"end","op":"pgroll.start","trace_id":"...","elapsed":172000,"workflow_id":"...","run_id":"...","activity_id":"..."}
+```
+
+- `flow` is always `"start"` or `"end"` — group/filter on this to find
+  unterminated operations (crashed activity, still-running command).
+- `trace_id` is a random UUID generated once per `startTrace` call and shared
+  by its start/end line, so retries and concurrent activities never get their
+  start/end lines cross-matched.
+- `op` names are dotted (`pgroll.start`, `pgstream.run`, `preview.clone`,
+  `exec.pgroll`, `exec.psql`, ...) so an agent can filter by subsystem.
+  `exec.<binary>` lines come from `runCommand` and additionally carry a
+  `args` field that has been passed through `redactArgs` (DSNs redacted via
+  `redactDSN`), so raw commands are visible without leaking credentials.
+- `elapsed` (a `time.Duration`) is only present on the end line.
+- `workflow_id`/`run_id`/`activity_id` are added automatically from
+  `activity.GetInfo(ctx)` when running as a real Temporal activity; the
+  lookup is recovered from panic and silently omitted outside an activity
+  context (e.g. a unit test calling an activity method directly), so
+  `startTrace` is always safe to call in tests too.
+- On error, the end line is logged at `Error` level with an `error` field
+  instead of the normal `Info` level, so an agent scanning for failures can
+  filter on `level=ERROR AND flow=end` and read the paired `start` line (same
+  `trace_id`) for the inputs that led to it.
+
+### Where this could go next (not yet done)
+
+- No log *sink*/query layer exists yet — this only standardizes the shape of
+  the log lines the worker already emits to its configured `slog.Logger`.
+  Turning this into actual "agentic trace + flow analysis" needs something
+  downstream (e.g. shipping JSON logs to a queryable store) to read
+  `trace_id`/`flow`/`op`/`workflow_id` and reconstruct/visualize the DAG of a
+  run; that consumer does not exist in this repo yet.
+- `trace_id` is per-operation, not per-workflow-run. There is no single ID
+  that threads together every `startTrace` call within one Temporal workflow
+  execution (that role is currently played by `workflow_id`+`run_id`
+  together, which is coarser and doesn't let you order steps within a single
+  attempt as cleanly as a dedicated parent/child span ID would). If deeper
+  trace analysis is needed later, consider passing a per-run trace/span ID
+  through `context.Context` (workflow-safe: derive it deterministically from
+  `workflow.GetInfo(ctx).WorkflowExecution` inside workflow code, since a
+  random ID generated in workflow code would break Temporal determinism —
+  `uuid.NewString()` inside `startTrace` is only safe here because
+  `startTrace` is only ever called from activity code, never workflow code).
 
 ## Misc
 

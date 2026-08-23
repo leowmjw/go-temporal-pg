@@ -9,55 +9,45 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os/exec"
-	"strings"
 	"time"
-
 
 	"github.com/leowmjw/go-temporal-pg/pgschema/internal/types"
 )
 
 // PgstreamActivities holds CDC-related Temporal activities backed by pgstream.
 type PgstreamActivities struct {
-	InitFn    func(ctx context.Context, cfg types.StreamConfig) error
-	RunFn     func(ctx context.Context, cfg types.StreamConfig) error
-	StopFn    func(ctx context.Context, cfg types.StreamConfig) error
-	GetLagFn  func(ctx context.Context, cfg types.StreamConfig) (int64, error)
+	baseActivities
+	InitFn   func(ctx context.Context, cfg types.StreamConfig) error
+	RunFn    func(ctx context.Context, cfg types.StreamConfig) error
+	StopFn   func(ctx context.Context, cfg types.StreamConfig) error
+	GetLagFn func(ctx context.Context, cfg types.StreamConfig) (int64, error)
 	// PollLagFn optionally overrides the entire PollLag loop for testing.
 	// When nil, the default ticker-based implementation is used.
 	PollLagFn func(ctx context.Context, cfg types.StreamConfig, interval time.Duration) (int64, error)
-	log       *slog.Logger
 }
 
 // NewPgstreamActivities returns a PgstreamActivities wired to the real
 // `pgstream` binary.  Any field can be replaced in tests.
 func NewPgstreamActivities(log *slog.Logger) *PgstreamActivities {
-	a := &PgstreamActivities{log: log}
+	a := &PgstreamActivities{baseActivities: baseActivities{log: log}}
 	a.InitFn = a.defaultInit
 	a.RunFn = a.defaultRun
 	a.StopFn = a.defaultStop
 	a.GetLagFn = a.defaultGetLag
 	return a
 }
-// logger returns the struct's logger, falling back to slog.Default() if nil.
-func (a *PgstreamActivities) logger() *slog.Logger {
-	if a.log == nil {
-		return slog.Default()
-	}
-	return a.log
-}
-
 
 // ─── Temporal activity methods ────────────────────────────────────────────────
 
 // InitPgstream initialises the pgstream metadata schema and replication slot
 // in the source Postgres database.  Idempotent — safe to retry.
 func (a *PgstreamActivities) InitPgstream(ctx context.Context, cfg types.StreamConfig) error {
-	a.logger().InfoContext(ctx, "initialising pgstream",
+	end := a.startTrace(ctx, "pgstream.init",
 		slog.String("stream_id", cfg.StreamID),
 		slog.String("slot", cfg.ReplicationSlotName))
-
-	if err := a.InitFn(ctx, cfg); err != nil {
+	err := a.InitFn(ctx, cfg)
+	end(err)
+	if err != nil {
 		return &types.StreamError{StreamID: cfg.StreamID, Wrapped: err}
 	}
 	return nil
@@ -68,8 +58,7 @@ func (a *PgstreamActivities) InitPgstream(ctx context.Context, cfg types.StreamC
 // stuck workers.  The activity exits cleanly when ctx is cancelled (Stop
 // signal from the workflow).
 func (a *PgstreamActivities) RunStream(ctx context.Context, cfg types.StreamConfig) error {
-	a.logger().InfoContext(ctx, "starting CDC stream",
-		slog.String("stream_id", cfg.StreamID))
+	end := a.startTrace(ctx, "pgstream.run", slog.String("stream_id", cfg.StreamID))
 	safeHeartbeat(ctx, "stream_starting")
 
 	// RunFn (the real implementation shells out and blocks for the entire
@@ -84,6 +73,7 @@ func (a *PgstreamActivities) RunStream(ctx context.Context, cfg types.StreamConf
 	for {
 		select {
 		case err := <-resultCh:
+			end(err)
 			if err != nil {
 				return &types.StreamError{StreamID: cfg.StreamID, Wrapped: err}
 			}
@@ -113,6 +103,8 @@ func (a *PgstreamActivities) PollLag(ctx context.Context, cfg types.StreamConfig
 		select {
 		case <-ctx.Done():
 			a.logger().InfoContext(ctx, "lag polling stopped",
+				slog.String("flow", "end"),
+				slog.String("op", "pgstream.poll_lag"),
 				slog.String("stream_id", cfg.StreamID),
 				slog.Int64("last_lag_bytes", lastLag))
 			return lastLag, nil
@@ -120,6 +112,7 @@ func (a *PgstreamActivities) PollLag(ctx context.Context, cfg types.StreamConfig
 			lag, err := a.GetLagFn(ctx, cfg)
 			if err != nil {
 				a.logger().WarnContext(ctx, "failed to get lag",
+					slog.String("op", "pgstream.poll_lag"),
 					slog.String("stream_id", cfg.StreamID),
 					slog.String("error", err.Error()))
 				safeHeartbeat(ctx, "lag_poll_error")
@@ -127,6 +120,7 @@ func (a *PgstreamActivities) PollLag(ctx context.Context, cfg types.StreamConfig
 			}
 			lastLag = lag
 			a.logger().InfoContext(ctx, "replication lag",
+				slog.String("op", "pgstream.poll_lag"),
 				slog.String("stream_id", cfg.StreamID),
 				slog.Int64("lag_bytes", lag))
 			safeHeartbeat(ctx, fmt.Sprintf("lag_bytes=%d", lastLag))
@@ -136,10 +130,10 @@ func (a *PgstreamActivities) PollLag(ctx context.Context, cfg types.StreamConfig
 
 // StopStream gracefully signals pgstream to stop.
 func (a *PgstreamActivities) StopStream(ctx context.Context, cfg types.StreamConfig) error {
-	a.logger().InfoContext(ctx, "stopping CDC stream",
-		slog.String("stream_id", cfg.StreamID))
-
-	if err := a.StopFn(ctx, cfg); err != nil {
+	end := a.startTrace(ctx, "pgstream.stop", slog.String("stream_id", cfg.StreamID))
+	err := a.StopFn(ctx, cfg)
+	end(err)
+	if err != nil {
 		return &types.StreamError{StreamID: cfg.StreamID, Wrapped: err}
 	}
 	return nil
@@ -161,7 +155,7 @@ func (a *PgstreamActivities) defaultInit(ctx context.Context, cfg types.StreamCo
 		"init",
 		"--pgstream-pgurl", cfg.SourceDSN,
 	}
-	return runPgstream(ctx, args)
+	return a.runPgstream(ctx, args)
 }
 
 func (a *PgstreamActivities) defaultRun(ctx context.Context, cfg types.StreamConfig) error {
@@ -172,7 +166,7 @@ func (a *PgstreamActivities) defaultRun(ctx context.Context, cfg types.StreamCon
 		"--target", "postgres",
 		"--target-url", cfg.TargetDSN,
 	}
-	return runPgstreamHeartbeating(ctx, args, cfg.StreamID)
+	return a.runPgstreamHeartbeating(ctx, args, cfg.StreamID)
 }
 
 func (a *PgstreamActivities) defaultStop(_ context.Context, _ types.StreamConfig) error {
@@ -184,7 +178,7 @@ func (a *PgstreamActivities) defaultStop(_ context.Context, _ types.StreamConfig
 func (a *PgstreamActivities) defaultGetLag(ctx context.Context, cfg types.StreamConfig) (int64, error) {
 	// pgstream exposes lag via its status command (implementation-specific).
 	args := []string{"status", "--pgstream-pgurl", cfg.SourceDSN, "--output", "json"}
-	out, err := runPgstreamOutput(ctx, args)
+	out, err := a.runPgstreamOutput(ctx, args)
 	if err != nil {
 		return 0, err
 	}
@@ -202,54 +196,4 @@ func parseLagBytes(out []byte) (int64, error) {
 		return 0, fmt.Errorf("parsing pgstream status output: %w", err)
 	}
 	return status.LagBytes, nil
-}
-
-
-// runPgstreamHeartbeating runs a pgstream subcommand that may block for a long
-// time (e.g. `run`, which drives the CDC stream for up to 7 days) and records
-// a heartbeat on a fixed interval while it does, so Temporal's HeartbeatTimeout
-// does not fire against a healthy but silent process.
-func runPgstreamHeartbeating(ctx context.Context, args []string, streamID string) error {
-	cmd := exec.CommandContext(ctx, "pgstream", args...)
-	var combined strings.Builder
-	cmd.Stdout = &combined
-	cmd.Stderr = &combined
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("pgstream %s: %w", strings.Join(args, " "), err)
-	}
-
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case err := <-done:
-			if err != nil {
-				return fmt.Errorf("pgstream %s: %w\n%s", strings.Join(args, " "), err, combined.String())
-			}
-			return nil
-		case <-ticker.C:
-			safeHeartbeat(ctx, fmt.Sprintf("stream_id=%s running", streamID))
-		}
-	}
-}
-
-func runPgstream(ctx context.Context, args []string) error {
-	out, err := exec.CommandContext(ctx, "pgstream", args...).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("pgstream %s: %w\n%s", strings.Join(args, " "), err, string(out))
-	}
-	return nil
-}
-
-func runPgstreamOutput(ctx context.Context, args []string) ([]byte, error) {
-	out, err := exec.CommandContext(ctx, "pgstream", args...).Output()
-	if err != nil {
-		return nil, fmt.Errorf("pgstream %s: %w", strings.Join(args, " "), err)
-	}
-	return out, nil
 }

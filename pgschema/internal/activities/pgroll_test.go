@@ -54,7 +54,7 @@ func newTestPgrollActivities(
 	noopStatus := func(_ context.Context, _ types.MigrationInput) (*types.MigrationStatus, error) {
 		return &types.MigrationStatus{}, nil
 	}
-	a := &PgrollActivities{log: newTestLogger()}
+	a := &PgrollActivities{baseActivities: baseActivities{log: newTestLogger()}}
 	a.ValidateFn = orDefault(ValidateFn, noop)
 	a.StartFn = orDefault(StartFn, noop)
 	a.CompleteFn = orDefault(CompleteFn, noop)

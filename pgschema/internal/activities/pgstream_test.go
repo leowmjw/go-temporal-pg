@@ -51,7 +51,7 @@ func newTestPgstreamActivities(
 	noop := func(_ context.Context, _ types.StreamConfig) error { return nil }
 	noopLag := func(_ context.Context, _ types.StreamConfig) (int64, error) { return 0, nil }
 
-	a := &PgstreamActivities{log: newTestLogger()}
+	a := &PgstreamActivities{baseActivities: baseActivities{log: newTestLogger()}}
 	if InitFn != nil {
 		a.InitFn = InitFn
 	} else {

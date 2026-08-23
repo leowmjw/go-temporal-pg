@@ -18,6 +18,7 @@ import (
 
 // AlertActivities holds the human-escalation Temporal activity.
 type AlertActivities struct {
+	baseActivities
 	PageFn func(ctx context.Context, msg types.AlertMessage) error
 	// DefaultWebhookURL is used when an AlertMessage arrives with no
 	// WebhookURL set. Every real caller in this codebase (pageOperator in
@@ -27,37 +28,30 @@ type AlertActivities struct {
 	// or similar operator-supplied config.
 	DefaultWebhookURL string
 	httpClient        *http.Client
-	log               *slog.Logger
 }
 
 // NewAlertActivities returns an AlertActivities that POSTs to the webhook URL
 // in the AlertMessage.
 func NewAlertActivities(log *slog.Logger) *AlertActivities {
 	a := &AlertActivities{
-		httpClient: &http.Client{},
-		log:        log,
+		baseActivities: baseActivities{log: log},
+		httpClient:     &http.Client{},
 	}
 	a.PageFn = a.defaultPage
 	return a
 }
-// logger returns the struct's logger, falling back to slog.Default() if nil.
-func (a *AlertActivities) logger() *slog.Logger {
-	if a.log == nil {
-		return slog.Default()
-	}
-	return a.log
-}
-
 
 // Page sends an alert to the configured webhook.  The workflow calls this
 // whenever a non-retryable failure occurs, so a human operator can investigate.
 func (a *AlertActivities) Page(ctx context.Context, msg types.AlertMessage) error {
-	a.logger().InfoContext(ctx, "paging operator",
-		slog.String("workflow_id", msg.WorkflowID),
+	end := a.startTrace(ctx, "alert.page",
+		slog.String("target_workflow_id", msg.WorkflowID),
 		slog.String("severity", msg.Severity),
 		slog.String("title", msg.Title))
 
-	if err := a.PageFn(ctx, msg); err != nil {
+	err := a.PageFn(ctx, msg)
+	end(err)
+	if err != nil {
 		return fmt.Errorf("alert page failed: %w", err)
 	}
 	return nil

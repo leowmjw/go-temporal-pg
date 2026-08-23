@@ -57,7 +57,7 @@ func newTestPreviewDBActivities(
 	migPreviewFn func(context.Context, string, string) error,
 	DropFn func(context.Context, string) error,
 ) *PreviewDBActivities {
-	a := &PreviewDBActivities{log: newTestLogger()}
+	a := &PreviewDBActivities{baseActivities: baseActivities{log: newTestLogger()}}
 	if CloneFn != nil {
 		a.CloneFn = CloneFn
 	} else {
