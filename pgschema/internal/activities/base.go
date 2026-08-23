@@ -26,6 +26,8 @@ type baseActivities struct {
 	log *slog.Logger
 }
 
+var execCommandContext = exec.CommandContext
+
 // logger returns the configured logger, falling back to slog.Default() so an
 // Activities struct built as a zero value (e.g. in a test) never nil-panics
 // on a log call.
@@ -148,7 +150,7 @@ func (b baseActivities) runCommand(ctx context.Context, name string, args []stri
 
 	end := b.startTrace(ctx, "exec."+name, slog.String("args", strings.Join(redactArgs(args), " ")))
 
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd := execCommandContext(ctx, name, args...)
 	if cfg.stdin != "" {
 		cmd.Stdin = strings.NewReader(cfg.stdin)
 	}
@@ -166,7 +168,7 @@ func (b baseActivities) runCommand(ctx context.Context, name string, args []stri
 
 	end(err)
 	if err != nil {
-		return nil, fmt.Errorf("%s %s: %w — %s", name, strings.Join(args, " "), err, string(out))
+		return nil, fmt.Errorf("%s %s: %w — %s", name, strings.Join(redactArgs(args), " "), err, sanitizeCommandOutput(string(out), args))
 	}
 	return out, nil
 }
@@ -250,4 +252,15 @@ func (b baseActivities) runPgstreamOutput(ctx context.Context, args []string) ([
 func (b baseActivities) runPgstreamHeartbeating(ctx context.Context, args []string, streamID string) error {
 	_, err := b.runCommand(ctx, "pgstream", args, withHeartbeat(fmt.Sprintf("stream_id=%s running", streamID)))
 	return err
+}
+
+func sanitizeCommandOutput(out string, args []string) string {
+	masked := out
+	for _, arg := range args {
+		redacted := redactDSN(arg)
+		if redacted != arg {
+			masked = strings.ReplaceAll(masked, arg, redacted)
+		}
+	}
+	return masked
 }

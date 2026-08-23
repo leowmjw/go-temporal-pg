@@ -64,6 +64,21 @@ func newTestPgrollActivities(
 	} else {
 		a.StatusFn = noopStatus
 	}
+	a.VersionFn = func(_ context.Context, _ types.MigrationInput) (string, error) { return "v0.16.2", nil }
+	a.ReadinessFn = func(_ context.Context, _ types.MigrationInput) (*types.PgrollReadiness, error) {
+		return &types.PgrollReadiness{Initialized: true}, nil
+	}
+	a.LatestSchemaFn = func(_ context.Context, _ types.MigrationInput) (string, error) { return "public_test", nil }
+	a.RiskFn = func(_ context.Context, _ types.MigrationInput) (*types.MigrationRiskReport, error) {
+		return &types.MigrationRiskReport{MigrationName: "test", OverallRisk: "low"}, nil
+	}
+	a.ReconcileFn = func(_ context.Context, input types.ReconcileInput) (*types.ReconciliationResult, error) {
+		status, _ := a.StatusFn(context.Background(), input.Migration)
+		return &types.ReconciliationResult{Action: "continue", Status: status}, nil
+	}
+	a.BaselineFn = func(_ context.Context, input types.BaselineInput) (*types.BaselineResult, error) {
+		return &types.BaselineResult{Version: input.Version, Directory: input.Directory, Schema: input.Schema, Status: "created"}, nil
+	}
 	return a
 }
 
@@ -325,4 +340,89 @@ func containsSubstring(s, sub string) bool {
 			}
 			return false
 		}())
+}
+
+func TestCheckPgrollVersion_Success(t *testing.T) {
+	a := newTestPgrollActivities(nil, nil, nil, nil, nil)
+	a.VersionFn = func(_ context.Context, _ types.MigrationInput) (string, error) {
+		return "v0.16.2", nil
+	}
+
+	env := newActEnv(t)
+	env.RegisterActivity(a.CheckPgrollVersion)
+	val, err := env.ExecuteActivity(a.CheckPgrollVersion, types.MigrationInput{})
+	require.NoError(t, err)
+
+	var got string
+	require.NoError(t, val.Get(&got))
+	assert.Equal(t, "v0.16.2", got)
+}
+
+func TestGetLatestSchema_Success(t *testing.T) {
+	a := newTestPgrollActivities(nil, nil, nil, nil, nil)
+	a.LatestSchemaFn = func(_ context.Context, _ types.MigrationInput) (string, error) {
+		return "public_add_email", nil
+	}
+
+	env := newActEnv(t)
+	env.RegisterActivity(a.GetLatestSchema)
+	val, err := env.ExecuteActivity(a.GetLatestSchema, types.MigrationInput{Schema: "public"})
+	require.NoError(t, err)
+
+	var got string
+	require.NoError(t, val.Get(&got))
+	assert.Equal(t, "public_add_email", got)
+}
+
+func TestAnalyzeMigrationRisk_BlockedRawSQL(t *testing.T) {
+	a := NewPgrollActivities(newTestLogger())
+	env := newActEnv(t)
+	env.RegisterActivity(a.AnalyzeMigrationRisk)
+	val, err := env.ExecuteActivity(a.AnalyzeMigrationRisk, types.MigrationInput{
+		Schema:        "public",
+		MigrationJSON: `{"name":"danger","operations":[{"sql":{"up":"DELETE FROM users"}}]}`,
+		Policy:        types.MigrationPolicy{BlockRawSQL: true},
+	})
+	require.NoError(t, err)
+
+	var report types.MigrationRiskReport
+	require.NoError(t, val.Get(&report))
+	assert.True(t, report.Blocked)
+	assert.Equal(t, "high", report.OverallRisk)
+	require.Len(t, report.Findings, 1)
+	assert.Equal(t, "raw_sql", report.Findings[0].Category)
+}
+
+func TestReconcileMigrationState_AlreadyComplete(t *testing.T) {
+	a := newTestPgrollActivities(nil, nil, nil, nil,
+		func(_ context.Context, _ types.MigrationInput) (*types.MigrationStatus, error) {
+			return &types.MigrationStatus{Status: "Complete", Version: "add_email", Schema: "public"}, nil
+		})
+	a.ReconcileFn = func(_ context.Context, input types.ReconcileInput) (*types.ReconciliationResult, error) {
+		status, _ := a.StatusFn(context.Background(), input.Migration)
+		return &types.ReconciliationResult{Action: "already_complete", Status: status}, nil
+	}
+
+	env := newActEnv(t)
+	env.RegisterActivity(a.ReconcileMigrationState)
+	val, err := env.ExecuteActivity(a.ReconcileMigrationState, types.ReconcileInput{
+		Phase: "before_start",
+		Migration: types.MigrationInput{
+			Schema:        "public",
+			MigrationJSON: `{"name":"add_email","operations":[]}`,
+		},
+	})
+	require.NoError(t, err)
+
+	var result types.ReconciliationResult
+	require.NoError(t, val.Get(&result))
+	assert.Equal(t, "already_complete", result.Action)
+	require.NotNil(t, result.Status)
+	assert.Equal(t, "add_email", result.Status.Version)
+}
+
+func TestParsePgrollStatusOutput_Malformed(t *testing.T) {
+	_, err := parsePgrollStatusOutput([]byte(`{"status":`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parsing pgroll status output")
 }

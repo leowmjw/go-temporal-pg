@@ -18,76 +18,55 @@ const (
 	SchemaMigrationTaskQueue = "pgschema-migration"
 
 	// Signal names — using constants prevents typos across workflow + tests.
-	SignalAppReady = "app-ready"   // app has been redeployed on new schema
-	SignalRollback = "rollback"    // operator requests rollback
+	SignalAppReady = "app-ready" // app has been redeployed on new schema
+	SignalRollback = "rollback"  // operator requests rollback
 
-	// Query names
+	// Query names.
 	QueryMigrationProgress = "migration-progress"
 
 	// GetVersion change IDs — increment when adding non-deterministic code paths.
-	versionAddUpdate = 1 // version when Update handler was added
+	versionAddUpdate     = 1
+	versionPgrollRoadmap = 1
 )
 
-// SchemaMigrationWorkflow orchestrates a zero-downtime pgroll schema migration:
-//
-//   ValidateMigration
-//     → StartMigration          (expand phase: old + new schemas coexist)
-//       → WaitForAppReady       (signal or timeout; operator confirms deploy)
-//         → CompleteMigration   (contract phase: old schema removed)
-//           → Verify            (query status, assert "Complete")
-//
-// At any point a "rollback" signal aborts the workflow and compensates.
-// On unrecoverable failure the Page alert activity is invoked.
-//
-// Temporal features used:
-//   - RegisterUpdateHandlerWithOptions with Validator (Go SDK v1.22+)
-//   - Signal channels with drainable ReceiveAsync pattern
-//   - Query handler (read-only progress)
-//   - workflow.GetVersion for safe future code upgrades
+// SchemaMigrationWorkflow orchestrates a zero-downtime pgroll schema migration.
 func SchemaMigrationWorkflow(ctx workflow.Context, input types.MigrationInput) (*types.ProgressResponse, error) {
 	logger := workflow.GetLogger(ctx)
-	logger.Info("SchemaMigrationWorkflow starting",
-		slog.String("schema", input.Schema))
+	logger.Info("SchemaMigrationWorkflow starting", slog.String("schema", input.Schema))
 
-	// ── Version gate ──────────────────────────────────────────────────────────
-	// workflow.GetVersion lets us change workflow logic safely for in-flight
-	// executions.  New runs get versionAddUpdate; replayed old histories get
-	// workflow.DefaultVersion and skip the Update handler registration.
-	v := workflow.GetVersion(ctx, "add-update-handler", workflow.DefaultVersion, versionAddUpdate)
+	updateVersion := workflow.GetVersion(ctx, "add-update-handler", workflow.DefaultVersion, versionAddUpdate)
+	roadmapVersion := workflow.GetVersion(ctx, "pgroll-roadmap", workflow.DefaultVersion, versionPgrollRoadmap)
+	roadmapEnabled := roadmapVersion >= versionPgrollRoadmap
 
-	// ── Progress state (mutated only from the workflow goroutine) ─────────────
 	progress := &types.ProgressResponse{
 		Status:      "running",
 		Phase:       "init",
 		LastUpdated: workflow.Now(ctx),
 	}
+	setProgress := func(phase string, percent int, message string) {
+		progress.Phase = phase
+		progress.Percent = percent
+		progress.LastUpdated = workflow.Now(ctx)
+		if message != "" {
+			progress.Message = message
+		}
+	}
 
-	// ── Query handler — read-only, no side effects ────────────────────────────
-	if err := workflow.SetQueryHandler(ctx, QueryMigrationProgress,
-		func() (*types.ProgressResponse, error) { return progress, nil },
-	); err != nil {
+	if err := workflow.SetQueryHandler(ctx, QueryMigrationProgress, func() (*types.ProgressResponse, error) {
+		return progress, nil
+	}); err != nil {
 		return nil, fmt.Errorf("register query handler: %w", err)
 	}
 
-	// extendWaitCh carries extension amounts (in minutes) from the "extend-wait"
-	// Update handler into the Step-3 wait loop below, which is the only place
-	// that actually owns the app-ready deadline.  Buffered so a call arriving
-	// before Step 3 begins (e.g. during validate/start) is not lost.
 	extendWaitCh := workflow.NewBufferedChannel(ctx, 16)
-
-	// ── Update handler (SDK v1.22+) — operator can bump TTL mid-flight ───────
-	// Only registered for workflow runs that include this version.
-	if v >= versionAddUpdate {
+	if updateVersion >= versionAddUpdate {
 		if err := workflow.SetUpdateHandlerWithOptions(ctx,
 			"extend-wait",
 			func(uCtx workflow.Context, extraMinutes int) (string, error) {
 				if extraMinutes <= 0 {
 					return "", errors.New("extraMinutes must be > 0")
 				}
-				logger.Info("extending app-ready wait",
-					slog.Int("extra_minutes", extraMinutes))
-				// Deliver the extension to the Step-3 wait loop so the actual
-				// deadline moves, not just this handler's return value.
+				logger.Info("extending app-ready wait", slog.Int("extra_minutes", extraMinutes))
 				extendWaitCh.Send(uCtx, extraMinutes)
 				return fmt.Sprintf("wait extended by %d minutes", extraMinutes), nil
 			},
@@ -104,11 +83,9 @@ func SchemaMigrationWorkflow(ctx workflow.Context, input types.MigrationInput) (
 		}
 	}
 
-	// ── Signal channels ───────────────────────────────────────────────────────
 	rollbackCh := workflow.GetSignalChannel(ctx, SignalRollback)
 	appReadyCh := workflow.GetSignalChannel(ctx, SignalAppReady)
 
-	// Standard activity options — short timeout, aggressive retry.
 	actOpts := workflow.ActivityOptions{
 		StartToCloseTimeout: 10 * time.Minute,
 		RetryPolicy: &temporal.RetryPolicy{
@@ -120,44 +97,125 @@ func SchemaMigrationWorkflow(ctx workflow.Context, input types.MigrationInput) (
 	}
 	ctx = workflow.WithActivityOptions(ctx, actOpts)
 
-	// checkRollback drains the rollback channel non-blockingly.
 	checkRollback := func() bool {
 		var sig string
 		return rollbackCh.ReceiveAsync(&sig)
 	}
+	updateStatus := func(status *types.MigrationStatus) {
+		if status == nil {
+			return
+		}
+		progress.PgrollStatus = status
+		progress.LastUpdated = workflow.Now(ctx)
+	}
+	bestEffortStatus := func() {
+		if !roadmapEnabled {
+			return
+		}
+		var status types.MigrationStatus
+		if err := workflow.ExecuteActivity(ctx, (*activities.PgrollActivities).GetMigrationStatus, input).Get(ctx, &status); err != nil {
+			logger.Warn("failed to refresh pgroll status", slog.String("error", err.Error()), slog.String("phase", progress.Phase))
+			return
+		}
+		updateStatus(&status)
+	}
+	reconcile := func(phase string) (*types.ReconciliationResult, error) {
+		if !roadmapEnabled {
+			return &types.ReconciliationResult{Action: "continue"}, nil
+		}
+		var result types.ReconciliationResult
+		err := workflow.ExecuteActivity(ctx, (*activities.PgrollActivities).ReconcileMigrationState, types.ReconcileInput{Migration: input, Phase: phase}).Get(ctx, &result)
+		if err != nil {
+			return nil, err
+		}
+		progress.ReconciliationAction = result.Action
+		updateStatus(result.Status)
+		return &result, nil
+	}
 
-	// ── Step 1: Validate ──────────────────────────────────────────────────────
-	progress.Phase, progress.Percent = "validating", 5
+	if roadmapEnabled {
+		setProgress("preflighting", 1, "checking pgroll binary and metadata")
+		if err := workflow.ExecuteActivity(ctx, (*activities.PgrollActivities).CheckPgrollVersion, input).Get(ctx, &progress.PgrollVersion); err != nil {
+			progress.Status = "failed"
+			progress.Message = err.Error()
+			return nil, err
+		}
+		var readiness types.PgrollReadiness
+		if err := workflow.ExecuteActivity(ctx, (*activities.PgrollActivities).CheckPgrollReadiness, input).Get(ctx, &readiness); err != nil {
+			progress.Status = "failed"
+			progress.Message = err.Error()
+			return nil, err
+		}
+		if readiness.Message != "" {
+			progress.Message = readiness.Message
+		}
+		var risk types.MigrationRiskReport
+		if err := workflow.ExecuteActivity(ctx, (*activities.PgrollActivities).AnalyzeMigrationRisk, input).Get(ctx, &risk); err != nil {
+			progress.Status = "failed"
+			progress.Message = err.Error()
+			return nil, err
+		}
+		progress.RiskReport = &risk
+		if risk.Blocked || risk.RequiresApproval {
+			progress.Status = "failed"
+			progress.Message = risk.Summary
+			return nil, temporal.NewNonRetryableApplicationError(risk.Summary, "migration-policy", nil)
+		}
+		bestEffortStatus()
+	}
+
+	setProgress("validating", 5, progress.Message)
 	if err := workflow.ExecuteActivity(ctx, (*activities.PgrollActivities).ValidateMigration, input).Get(ctx, nil); err != nil {
-		return triggerRollback(ctx, input, progress, err, "validate")
+		return triggerRollback(ctx, input, progress, err, "validate", roadmapEnabled)
 	}
 	if checkRollback() {
-		return triggerRollback(ctx, input, progress, nil, "post-validate-signal")
+		return triggerRollback(ctx, input, progress, nil, "post-validate-signal", roadmapEnabled)
 	}
 
-	// ── Step 2: Start (expand phase) ──────────────────────────────────────────
-	progress.Phase, progress.Percent = "starting", 20
-	startOpts := actOpts
-	startOpts.StartToCloseTimeout = 30 * time.Minute
-	startOpts.HeartbeatTimeout = 5 * time.Minute
-	if err := workflow.ExecuteActivity(
-		workflow.WithActivityOptions(ctx, startOpts),
-		(*activities.PgrollActivities).StartMigration, input,
-	).Get(ctx, nil); err != nil {
-		return triggerRollback(ctx, input, progress, err, "start")
+	shouldStart := true
+	if roadmapEnabled {
+		bestEffortStatus()
+		result, err := reconcile("before_start")
+		if err != nil {
+			return triggerRollback(ctx, input, progress, err, "reconcile-before-start", roadmapEnabled)
+		}
+		switch result.Action {
+		case "already_complete":
+			bestEffortStatus()
+			setProgress("completed", 100, result.Reason)
+			progress.Status = "completed"
+			return progress, nil
+		case "resume_wait":
+			shouldStart = false
+			progress.Message = result.Reason
+		case "fail":
+			progress.Status = "failed"
+			progress.Message = result.Reason
+			return nil, temporal.NewNonRetryableApplicationError(result.Reason, "pgroll-reconcile", nil)
+		}
 	}
 
-	// ── Step 3: Wait for app-ready signal (or timeout + rollback) ────────────
-	progress.Phase, progress.Percent = "waiting_for_app_ready", 40
+	if shouldStart {
+		setProgress("starting", 20, progress.Message)
+		startOpts := actOpts
+		startOpts.StartToCloseTimeout = 30 * time.Minute
+		startOpts.HeartbeatTimeout = 5 * time.Minute
+		if err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, startOpts), (*activities.PgrollActivities).StartMigration, input).Get(ctx, nil); err != nil {
+			return triggerRollback(ctx, input, progress, err, "start", roadmapEnabled)
+		}
+	}
 
+	if roadmapEnabled {
+		bestEffortStatus()
+		if err := workflow.ExecuteActivity(ctx, (*activities.PgrollActivities).GetLatestSchema, input).Get(ctx, &progress.LatestSchema); err != nil {
+			return triggerRollback(ctx, input, progress, err, "latest-schema", roadmapEnabled)
+		}
+	}
+
+	setProgress("waiting_for_app_ready", 40, progress.Message)
 	const initialAppReadyWait = 60 * time.Minute
 	waitDeadline := workflow.Now(ctx).Add(initialAppReadyWait)
 
-	// timedOut is distinct from "loop condition false because of app-ready or
-	// rollback" — it's what actually ends the loop when the deadline is
-	// reached with no extension pending. Without it, a plain timeout would
-	// leave every loop-condition flag false and spin forever recreating
-	// zero-duration timers instead of ever falling through to rollback.
 	var appReadyReceived, rollbackRequested, timedOut bool
 	for !appReadyReceived && !rollbackRequested && !timedOut {
 		remaining := waitDeadline.Sub(workflow.Now(ctx))
@@ -166,7 +224,6 @@ func SchemaMigrationWorkflow(ctx workflow.Context, input types.MigrationInput) (
 		}
 		waitTimeout := workflow.NewTimer(ctx, remaining)
 		sel := workflow.NewSelector(ctx)
-
 		sel.AddReceive(appReadyCh, func(c workflow.ReceiveChannel, _ bool) {
 			c.Receive(ctx, nil)
 			appReadyReceived = true
@@ -182,57 +239,86 @@ func SchemaMigrationWorkflow(ctx workflow.Context, input types.MigrationInput) (
 			var extraMinutes int
 			c.Receive(ctx, &extraMinutes)
 			waitDeadline = waitDeadline.Add(time.Duration(extraMinutes) * time.Minute)
-			logger.Info("app-ready wait deadline extended",
-				slog.Int("extra_minutes", extraMinutes),
-				slog.Time("new_deadline", waitDeadline))
+			logger.Info("app-ready wait deadline extended", slog.Int("extra_minutes", extraMinutes), slog.Time("new_deadline", waitDeadline))
 		})
 		sel.Select(ctx)
 	}
-
 	if !appReadyReceived {
-		// Timed out or rollback signal — compensate.
-		return triggerRollback(ctx, input, progress, nil, "app-ready-timeout")
+		return triggerRollback(ctx, input, progress, nil, "app-ready-timeout", roadmapEnabled)
 	}
 
-	// ── Step 4: Complete (contract phase) ─────────────────────────────────────
-	progress.Phase, progress.Percent = "completing", 70
-	if err := workflow.ExecuteActivity(ctx, (*activities.PgrollActivities).CompleteMigration, input).Get(ctx, nil); err != nil {
-		return triggerRollback(ctx, input, progress, err, "complete")
+	shouldComplete := true
+	if roadmapEnabled {
+		bestEffortStatus()
+		result, err := reconcile("before_complete")
+		if err != nil {
+			return triggerRollback(ctx, input, progress, err, "reconcile-before-complete", roadmapEnabled)
+		}
+		switch result.Action {
+		case "skip_complete", "already_complete":
+			shouldComplete = false
+			progress.Message = result.Reason
+		case "fail":
+			return triggerRollback(ctx, input, progress, temporal.NewNonRetryableApplicationError(result.Reason, "pgroll-reconcile", nil), "reconcile-before-complete", roadmapEnabled)
+		}
 	}
 
-	// ── Step 5: Verify ────────────────────────────────────────────────────────
-	progress.Phase, progress.Percent = "verifying", 90
+	if shouldComplete {
+		setProgress("completing", 70, progress.Message)
+		if err := workflow.ExecuteActivity(ctx, (*activities.PgrollActivities).CompleteMigration, input).Get(ctx, nil); err != nil {
+			return triggerRollback(ctx, input, progress, err, "complete", roadmapEnabled)
+		}
+	}
+
+	setProgress("verifying", 90, progress.Message)
 	var status types.MigrationStatus
 	if err := workflow.ExecuteActivity(ctx, (*activities.PgrollActivities).GetMigrationStatus, input).Get(ctx, &status); err != nil {
-		// Non-fatal: log and continue; the migration is actually complete.
 		logger.Warn("failed to verify migration status", slog.String("error", err.Error()))
-	} else if status.Status != "Complete" {
-		logger.Warn("unexpected migration status", slog.String("status", status.Status))
+	} else {
+		updateStatus(&status)
+		if status.Status != "Complete" {
+			logger.Warn("unexpected migration status", slog.String("status", status.Status))
+		}
 	}
 
-	progress.Phase = "completed"
+	setProgress("completed", 100, progress.Message)
 	progress.Status = "completed"
-	progress.Percent = 100
-	progress.LastUpdated = workflow.Now(ctx)
-	logger.Info("SchemaMigrationWorkflow completed",
-		slog.String("schema", input.Schema))
+	logger.Info("SchemaMigrationWorkflow completed", slog.String("schema", input.Schema), slog.String("latest_schema", progress.LatestSchema), slog.String("pgroll_version", progress.PgrollVersion))
 	return progress, nil
 }
 
-// triggerRollback executes the rollback activity, pages a human if it fails,
-// and returns the final ProgressResponse.
 func triggerRollback(
 	ctx workflow.Context,
 	input types.MigrationInput,
 	progress *types.ProgressResponse,
 	cause error,
 	phase string,
+	roadmapEnabled bool,
 ) (*types.ProgressResponse, error) {
 	logger := workflow.GetLogger(ctx)
 	logger.Info("triggering rollback", slog.String("phase", phase))
 
 	progress.Phase = "rolling_back"
 	progress.Status = "rolling_back"
+	progress.LastUpdated = workflow.Now(ctx)
+
+	if roadmapEnabled {
+		var decision types.ReconciliationResult
+		if err := workflow.ExecuteActivity(ctx, (*activities.PgrollActivities).ReconcileMigrationState, types.ReconcileInput{Migration: input, Phase: "before_rollback"}).Get(ctx, &decision); err == nil {
+			progress.ReconciliationAction = decision.Action
+			if decision.Status != nil {
+				progress.PgrollStatus = decision.Status
+			}
+			if decision.Action == "skip_rollback" {
+				progress.Status = "rolled_back"
+				progress.Message = decision.Reason
+				progress.LastUpdated = workflow.Now(ctx)
+				return progress, cause
+			}
+		} else {
+			logger.Warn("rollback reconciliation failed", slog.String("error", err.Error()))
+		}
+	}
 
 	rollbackOpts := workflow.ActivityOptions{
 		StartToCloseTimeout: 15 * time.Minute,
@@ -242,25 +328,24 @@ func triggerRollback(
 			MaximumAttempts:    3,
 		},
 	}
-	rbErr := workflow.ExecuteActivity(
-		workflow.WithActivityOptions(ctx, rollbackOpts),
-		(*activities.PgrollActivities).RollbackMigration, input,
-	).Get(ctx, nil)
-
+	rbErr := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, rollbackOpts), (*activities.PgrollActivities).RollbackMigration, input).Get(ctx, nil)
 	if rbErr != nil {
-		logger.Error("rollback failed — paging operator",
-			slog.String("rollback_error", rbErr.Error()))
+		logger.Error("rollback failed — paging operator", slog.String("rollback_error", rbErr.Error()))
 		_ = pageOperator(ctx, progress, rbErr, "critical", "rollback-failed")
 		progress.Status = "rollback_failed"
 		progress.Message = rbErr.Error()
 		return progress, rbErr
 	}
 
+	if roadmapEnabled {
+		var status types.MigrationStatus
+		if err := workflow.ExecuteActivity(ctx, (*activities.PgrollActivities).GetMigrationStatus, input).Get(ctx, &status); err == nil {
+			progress.PgrollStatus = &status
+		}
+	}
 	if cause != nil {
-		// Page on the original cause too so the operator knows why.
 		_ = pageOperator(ctx, progress, cause, "warning", phase)
 	}
-
 	progress.Status = "rolled_back"
 	progress.Message = fmt.Sprintf("rolled back after failure in phase %q", phase)
 	progress.LastUpdated = workflow.Now(ctx)
@@ -277,8 +362,6 @@ func pageOperator(ctx workflow.Context, progress *types.ProgressResponse, err er
 	detail := phase
 	if err != nil {
 		detail = err.Error()
-
-		// Use errors.AsType (Go 1.26) for typed extraction.
 		var migErr *types.MigrationError
 		if errors.As(err, &migErr) {
 			detail = fmt.Sprintf("migration error in phase %q: %s", migErr.Phase, migErr.Wrapped)
@@ -293,8 +376,5 @@ func pageOperator(ctx workflow.Context, progress *types.ProgressResponse, err er
 		Title:      fmt.Sprintf("pgschema: %s failure in workflow %s", phase, progress.Phase),
 		Detail:     detail,
 	}
-	return workflow.ExecuteActivity(
-		workflow.WithActivityOptions(ctx, pageOpts),
-		(*activities.AlertActivities).Page, msg,
-	).Get(ctx, nil)
+	return workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, pageOpts), (*activities.AlertActivities).Page, msg).Get(ctx, nil)
 }

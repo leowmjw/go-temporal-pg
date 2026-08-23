@@ -94,17 +94,36 @@ type fakeMigration struct {
 func newFakeMigration(opts ...func(*fakeMigration)) *fakeMigration {
 	f := &fakeMigration{
 		pgroll: &activities.PgrollActivities{
-			ValidateFn:  func(_ context.Context, _ types.MigrationInput) error { return nil },
-			StartFn:     func(_ context.Context, _ types.MigrationInput) error { return nil },
-			CompleteFn:  func(_ context.Context, _ types.MigrationInput) error { return nil },
-			RollbackFn:  func(_ context.Context, _ types.MigrationInput) error { return nil },
-			StatusFn:    func(_ context.Context, _ types.MigrationInput) (*types.MigrationStatus, error) {
-				return &types.MigrationStatus{Status: "Complete"}, nil
+			ValidateFn: func(_ context.Context, _ types.MigrationInput) error { return nil },
+			StartFn:    func(_ context.Context, _ types.MigrationInput) error { return nil },
+			CompleteFn: func(_ context.Context, _ types.MigrationInput) error { return nil },
+			RollbackFn: func(_ context.Context, _ types.MigrationInput) error { return nil },
+			StatusFn: func(_ context.Context, _ types.MigrationInput) (*types.MigrationStatus, error) {
+				return &types.MigrationStatus{Status: "Complete", Version: "add_email", Schema: "public"}, nil
+			},
+			VersionFn: func(_ context.Context, _ types.MigrationInput) (string, error) {
+				return "v0.16.2", nil
+			},
+			ReadinessFn: func(_ context.Context, _ types.MigrationInput) (*types.PgrollReadiness, error) {
+				return &types.PgrollReadiness{Initialized: true, Message: "pgroll metadata ready"}, nil
+			},
+			LatestSchemaFn: func(_ context.Context, _ types.MigrationInput) (string, error) {
+				return "public_add_email", nil
+			},
+			RiskFn: func(_ context.Context, _ types.MigrationInput) (*types.MigrationRiskReport, error) {
+				return &types.MigrationRiskReport{MigrationName: "add_email", OverallRisk: "low"}, nil
 			},
 		},
 		alert: &activities.AlertActivities{
 			PageFn: func(_ context.Context, _ types.AlertMessage) error { return nil },
 		},
+	}
+	f.pgroll.ReconcileFn = func(_ context.Context, input types.ReconcileInput) (*types.ReconciliationResult, error) {
+		status, _ := f.pgroll.StatusFn(context.Background(), input.Migration)
+		return &types.ReconciliationResult{Action: "continue", Status: status}, nil
+	}
+	f.pgroll.BaselineFn = func(_ context.Context, input types.BaselineInput) (*types.BaselineResult, error) {
+		return &types.BaselineResult{Version: input.Version, Directory: input.Directory, Schema: input.Schema, Status: "created"}, nil
 	}
 	for _, o := range opts {
 		o(f)
@@ -145,6 +164,9 @@ func (s *SchemaMigrationTestSuite) TestHappyPath() {
 	s.NoError(s.env.GetWorkflowResult(&result))
 	s.Equal("completed", result.Status)
 	s.Equal(100, result.Percent)
+	s.Equal("v0.16.2", result.PgrollVersion)
+	s.Equal("public_add_email", result.LatestSchema)
+	s.NotNil(result.PgrollStatus)
 }
 
 // ── ValidationFailure ─────────────────────────────────────────────────────────
@@ -382,8 +404,8 @@ func (s *SchemaMigrationTestSuite) TestUpdateHandler_ExtendWait_Invalid() {
 	var rejected bool
 	s.env.RegisterDelayedCallback(func() {
 		uc := &testsuite.TestUpdateCallback{
-			OnAccept: func() { s.Fail("should not accept invalid input") },
-			OnReject: func(err error) { rejected = true; s.Error(err) },
+			OnAccept:   func() { s.Fail("should not accept invalid input") },
+			OnReject:   func(err error) { rejected = true; s.Error(err) },
 			OnComplete: func(_ interface{}, _ error) {},
 		}
 		s.env.UpdateWorkflow("extend-wait", "", uc, -5)
@@ -415,6 +437,9 @@ func (s *SchemaMigrationTestSuite) TestProgressQuery_ReturnsCurrentPhase() {
 		s.NoError(val.Get(&p))
 		// At this point the workflow is waiting for app-ready signal.
 		s.Equal("waiting_for_app_ready", p.Phase)
+		s.Equal("v0.16.2", p.PgrollVersion)
+		s.Equal("public_add_email", p.LatestSchema)
+		s.NotNil(p.PgrollStatus)
 
 		s.env.SignalWorkflow(SignalAppReady, nil)
 	}, 5*time.Millisecond)
@@ -488,4 +513,3 @@ func TestWorkflowReplay_SchemaMigration(t *testing.T) {
 }
 
 // ── fake wiring helpers ───────────────────────────────────────────────────────
-
