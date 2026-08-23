@@ -493,7 +493,6 @@ func parseMigrationDocument(raw string) (*migrationDocument, error) {
 	}
 	var doc migrationDocument
 	dec := json.NewDecoder(strings.NewReader(raw))
-	dec.DisallowUnknownFields()
 	if err := dec.Decode(&doc); err != nil {
 		return nil, fmt.Errorf("parse migration json: %w", err)
 	}
