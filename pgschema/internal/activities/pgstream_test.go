@@ -3,6 +3,7 @@ package activities
 import (
 	"context"
 	"errors"
+	"os"
 	"testing"
 	"time"
 
@@ -358,4 +359,58 @@ func TestParseLagBytes(t *testing.T) {
 func TestParseLagBytes_MalformedJSON(t *testing.T) {
 	_, err := parseLagBytes([]byte(`not json`))
 	require.Error(t, err)
+}
+
+func TestRenderPgstreamConfig_Golden(t *testing.T) {
+	cfg := types.StreamConfig{
+		SourceDSN:           "postgres://source",
+		TargetDSN:           "postgres://target",
+		ReplicationSlotName: "slot1",
+		Mode:                types.StreamModeSnapshotAndReplication,
+		Filters: types.StreamFilters{
+			IncludedSchemas:       []string{"public"},
+			ExcludedTables:        []string{"audit.events"},
+			SchemaOnlyTables:      []string{"audit.*"},
+			IncludeDDLObjectTypes: []string{"tables"},
+		},
+		Snapshot: types.StreamSnapshotConfig{
+			Mode:                types.SnapshotModeFull,
+			ResetTarget:         true,
+			Repeatable:          true,
+			SnapshotWorkers:     2,
+			SchemaWorkers:       3,
+			TableWorkers:        4,
+			BatchBytes:          1024,
+			MaxConnections:      5,
+			DumpFile:            "snapshot.sql",
+			CreateTargetDB:      true,
+			CleanTargetDatabase: true,
+		},
+		SchemaChangePolicy: types.SchemaChangePolicyBlock,
+		Target: types.StreamTargetConfig{
+			Type: types.StreamTargetTypePostgres,
+			Postgres: &types.PostgresTargetConfig{
+				URL:                "postgres://target",
+				MaxConnections:     20,
+				OnConflictAction:   "nothing",
+				StrictMode:         true,
+				BatchTimeoutMS:     1000,
+				BatchSize:          500,
+				BatchMaxBytes:      2048,
+				BatchMaxQueueBytes: 4096,
+				BulkIngest:         true,
+				CopyWorkers:        2,
+			},
+		},
+		AnonymizationRules: []types.AnonymizationRule{
+			{Table: "users", Column: "email", Transformer: "email"},
+		},
+	}
+
+	got, err := renderPgstreamConfig(cfg)
+	require.NoError(t, err)
+
+	want, err := os.ReadFile("testdata/pgstream-snapshot-and-replication.golden.yaml")
+	require.NoError(t, err)
+	assert.Equal(t, string(want), string(got))
 }

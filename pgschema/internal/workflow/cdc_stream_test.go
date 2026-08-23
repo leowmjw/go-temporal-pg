@@ -75,10 +75,38 @@ type fakeStream struct {
 func newFakeStream(opts ...func(*fakeStream)) *fakeStream {
 	f := &fakeStream{
 		pgstream: &activities.PgstreamActivities{
-			InitFn:  func(_ context.Context, _ types.StreamConfig) error { return nil },
-			RunFn:   func(_ context.Context, _ types.StreamConfig) error { return nil },
-			StopFn:  func(_ context.Context, _ types.StreamConfig) error { return nil },
+			InitFn: func(_ context.Context, _ types.StreamConfig) error { return nil },
+			RunFn: func(ctx context.Context, _ types.StreamConfig) error {
+				<-ctx.Done()
+				return nil
+			},
+			StopFn:   func(_ context.Context, _ types.StreamConfig) error { return nil },
 			GetLagFn: func(_ context.Context, _ types.StreamConfig) (int64, error) { return 0, nil },
+			GetHealthFn: func(_ context.Context, cfg types.StreamConfig) (*types.StreamHealthResponse, error) {
+				return &types.StreamHealthResponse{
+					Mode:                  cfg.Mode,
+					Status:                "running",
+					Phase:                 "stream",
+					TargetType:            cfg.Target.Type,
+					ReplicationSlotName:   cfg.ReplicationSlotName,
+					ReplicationSlotActive: true,
+					SourceReachable:       true,
+					TargetReachable:       true,
+				}, nil
+			},
+			PreflightFn: func(_ context.Context, cfg types.StreamConfig) (*types.PreflightStatus, error) {
+				return &types.PreflightStatus{
+					PgstreamVersion:        "v1.4.1",
+					VersionMatchesExpected: true,
+					SourceReachable:        true,
+					TargetReachable:        true,
+					MetadataExists:         true,
+					SlotExists:             true,
+					SlotActive:             true,
+					SuggestedInitMode:      "skip",
+				}, nil
+			},
+			ValidateRulesFn: func(_ context.Context, _ types.StreamConfig, _ []types.AnonymizationRule) error { return nil },
 			// PollLagFn: return immediately on ctx cancellation for test speed.
 			PollLagFn: func(ctx context.Context, _ types.StreamConfig, _ time.Duration) (int64, error) {
 				<-ctx.Done()
@@ -106,7 +134,7 @@ func defaultStreamConfig() types.StreamConfig {
 		TargetDSN:           "host=localhost dbname=dst",
 		ReplicationSlotName: "pgstream_slot",
 		StreamID:            "stream-unit-test",
-		MaxIterations:       5,
+		MaxIterations:       1000,
 	}
 }
 
@@ -199,8 +227,8 @@ func (s *CDCStreamTestSuite) TestUpdateAnonymizationRules_Valid() {
 			{Table: "users", Column: "email", Transformer: "email"},
 		}
 		uc := &testsuite.TestUpdateCallback{
-			OnAccept:   func() {},
-			OnReject:   func(err error) { updateErr = err },
+			OnAccept: func() {},
+			OnReject: func(err error) { updateErr = err },
 			OnComplete: func(res interface{}, err error) {
 				updateErr = err
 				if str, ok := res.(string); ok {
@@ -260,8 +288,8 @@ func (s *CDCStreamTestSuite) TestUpdateAnonymizationRules_EmptyRejected() {
 	var rejected bool
 	s.env.RegisterDelayedCallback(func() {
 		uc := &testsuite.TestUpdateCallback{
-			OnAccept: func() { s.Fail("should not accept empty rules") },
-			OnReject: func(err error) { rejected = true },
+			OnAccept:   func() { s.Fail("should not accept empty rules") },
+			OnReject:   func(err error) { rejected = true },
 			OnComplete: func(_ interface{}, _ error) {},
 		}
 		s.env.UpdateWorkflow("update-anon-rules", "", uc, []types.AnonymizationRule{})
@@ -303,8 +331,18 @@ func (s *CDCStreamTestSuite) TestContinueAsNew_AfterMaxIterations() {
 
 func (s *CDCStreamTestSuite) TestLagQuery_ReturnsLatestValue() {
 	fake := newFakeStream(func(f *fakeStream) {
-		f.pgstream.GetLagFn = func(_ context.Context, _ types.StreamConfig) (int64, error) {
-			return 4096, nil
+		f.pgstream.GetHealthFn = func(_ context.Context, cfg types.StreamConfig) (*types.StreamHealthResponse, error) {
+			return &types.StreamHealthResponse{
+				Mode:                  cfg.Mode,
+				Status:                "running",
+				Phase:                 "stream",
+				TargetType:            cfg.Target.Type,
+				ReplicationSlotName:   cfg.ReplicationSlotName,
+				ReplicationSlotActive: true,
+				LagBytes:              4096,
+				SourceReachable:       true,
+				TargetReachable:       true,
+			}, nil
 		}
 	})
 	fake.register(s.env)
@@ -323,4 +361,54 @@ func (s *CDCStreamTestSuite) TestLagQuery_ReturnsLatestValue() {
 
 	s.env.ExecuteWorkflow(CDCStreamWorkflow, defaultStreamConfig())
 	s.True(s.env.IsWorkflowCompleted())
+}
+
+func (s *CDCStreamTestSuite) TestSnapshotMode_CompletesWithoutAlert() {
+	fake := newFakeStream(func(f *fakeStream) {
+		f.pgstream.RunFn = func(_ context.Context, _ types.StreamConfig) error { return nil }
+	})
+	fake.register(s.env)
+
+	cfg := defaultStreamConfig()
+	cfg.Mode = types.StreamModeSnapshot
+
+	s.env.ExecuteWorkflow(CDCStreamWorkflow, cfg)
+	s.True(s.env.IsWorkflowCompleted())
+	s.NoError(s.env.GetWorkflowError())
+}
+
+func (s *CDCStreamTestSuite) TestHealthGuardrail_StopOnLagThreshold() {
+	alertFired := false
+	fake := newFakeStream(func(f *fakeStream) {
+		f.pgstream.GetHealthFn = func(_ context.Context, cfg types.StreamConfig) (*types.StreamHealthResponse, error) {
+			return &types.StreamHealthResponse{
+				Mode:                  cfg.Mode,
+				Status:                "running",
+				Phase:                 "stream",
+				TargetType:            cfg.Target.Type,
+				ReplicationSlotName:   cfg.ReplicationSlotName,
+				ReplicationSlotActive: true,
+				LagBytes:              4096,
+				SourceReachable:       true,
+				TargetReachable:       true,
+			}, nil
+		}
+		f.alert.PageFn = func(_ context.Context, _ types.AlertMessage) error {
+			alertFired = true
+			return nil
+		}
+	})
+	fake.register(s.env)
+
+	cfg := defaultStreamConfig()
+	cfg.Guardrails = types.StreamGuardrails{
+		MaxLagBytes:    1024,
+		OnViolation:    types.GuardrailActionStop,
+		MaxLagDuration: 0,
+	}
+
+	s.env.ExecuteWorkflow(CDCStreamWorkflow, cfg)
+	s.True(s.env.IsWorkflowCompleted())
+	s.Error(s.env.GetWorkflowError())
+	s.True(alertFired)
 }
