@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -846,9 +847,6 @@ func buildSourceConfig(cfg types.StreamConfig) pgstreamConfigSource {
 			},
 		}
 	}
-	if rp := buildRetryPolicy(cfg.Target.Postgres); rp != nil {
-		source.RetryPolicy = rp
-	}
 	return pgstreamConfigSource{Postgres: source}
 }
 
@@ -1153,8 +1151,13 @@ func lookupValue(v any, key string) (any, bool) {
 		if found, ok := x[key]; ok {
 			return found, true
 		}
-		for _, value := range x {
-			if found, ok := lookupValue(value, key); ok {
+		keys := make([]string, 0, len(x))
+		for nestedKey := range x {
+			keys = append(keys, nestedKey)
+		}
+		sort.Strings(keys)
+		for _, nestedKey := range keys {
+			if found, ok := lookupValue(x[nestedKey], key); ok {
 				return found, true
 			}
 		}
