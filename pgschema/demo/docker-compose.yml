@@ -1,0 +1,34 @@
+# pgschema demo — throwaway Postgres for showcasing the pgroll workflow.
+#
+#   mise run demo-up      # start postgres, wait healthy, pgroll init
+#   mise run demo-reset   # wipe + recreate from scratch
+#   mise run demo-down    # stop and delete the demo volume
+#
+# This is NOT meant to represent a production topology — it's one database,
+# seeded with a small "users" table as it might look BEFORE pgroll is
+# adopted (see init/001_seed_users.sql), so the demo starts from a realistic
+# brownfield state rather than an empty schema.
+services:
+  postgres:
+    image: postgres:18
+    container_name: pgschema-demo-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: pgschema_demo
+    ports:
+      - "5432:5432"
+    volumes:
+      # Postgres 18's official image switched to pg_ctlcluster-style layout:
+      # mount the parent dir, not .../data, or the container refuses to start
+      # ("data in /var/lib/postgresql/data (unused mount/volume)").
+      - pgschema_demo_data:/var/lib/postgresql
+      - ./init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d pgschema_demo"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  pgschema_demo_data:

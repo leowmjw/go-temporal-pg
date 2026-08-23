@@ -1,0 +1,26 @@
+root = "."
+tmp_dir = "tmp"
+
+[build]
+cmd = "go build -o ./tmp/pgschema-demo-dev ./cmd/pgschema-demo"
+bin = "./tmp/pgschema-demo-dev"
+include_ext = ["go", "json"]
+exclude_dir = ["tmp", "bin", "test"]
+exclude_regex = ["_test\\.go$"]
+delay = 200
+# See .air.toml for why send_interrupt/kill_delay/clean_on_exit matter for a
+# clean shutdown under overmind (which stops managed processes with SIGTERM).
+send_interrupt = true
+kill_delay = "2s"
+stop_on_error = true
+
+[log]
+time = true
+
+[color]
+main = "cyan"
+build = "yellow"
+runner = "magenta"
+
+[misc]
+clean_on_exit = true

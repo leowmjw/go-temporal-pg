@@ -28,6 +28,11 @@ go.work.sum
 # env file
 .env
 
+# air (live reload) build output; overmind-managed temporal dev server state
+tmp/
+.data/
+.overmind.sock
+
 # Editor/IDE
 .idea/
 .vscode/

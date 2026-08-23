@@ -3,7 +3,6 @@
 package activities
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -202,15 +201,15 @@ func (a *PgrollActivities) defaultRollback(ctx context.Context, input types.Migr
 }
 
 func (a *PgrollActivities) defaultStatus(ctx context.Context, input types.MigrationInput) (*types.MigrationStatus, error) {
-	out, err := a.runCommand(ctx, "pgroll", []string{"--dsn", input.DSN, "--schema", input.Schema, "status", "--output", "json"}, withStdoutOnly())
+	out, err := a.runPgrollOutput(ctx, input.DSN, input.Schema, []string{"status"})
 	if err != nil {
-		return nil, fmt.Errorf("pgroll status failed: %w", err)
+		return nil, fmt.Errorf("pgroll status: %w", err)
 	}
-	status, err := parsePgrollStatusOutput(out)
-	if err != nil {
-		return nil, err
+	var s types.MigrationStatus
+	if err := json.Unmarshal(out, &s); err != nil {
+		return nil, fmt.Errorf("parsing pgroll status output: %w", err)
 	}
-	return status, nil
+	return &s, nil
 }
 
 func (a *PgrollActivities) defaultVersion(ctx context.Context, input types.MigrationInput) (string, error) {
@@ -260,7 +259,7 @@ func (a *PgrollActivities) defaultReadiness(ctx context.Context, input types.Mig
 }
 
 func (a *PgrollActivities) defaultLatestSchema(ctx context.Context, input types.MigrationInput) (string, error) {
-	out, err := a.runCommand(ctx, "pgroll", []string{"--dsn", input.DSN, "--schema", input.Schema, "latest", "schema"}, withStdoutOnly())
+	out, err := a.runCommand(ctx, "pgroll", []string{"--postgres-url", input.DSN, "--schema", input.Schema, "latest", "schema"}, withStdoutOnly())
 	if err != nil {
 		return "", fmt.Errorf("pgroll latest schema failed: %w", err)
 	}
@@ -368,7 +367,7 @@ func (a *PgrollActivities) defaultBaseline(ctx context.Context, input types.Base
 		}
 	}
 
-	args := []string{"--dsn", input.DSN, "--schema", input.Schema, "baseline", input.Version, input.Directory, "--yes"}
+	args := []string{"--postgres-url", input.DSN, "--schema", input.Schema, "baseline", input.Version, input.Directory, "--yes"}
 	if strings.EqualFold(input.Format, "json") || input.Format == "" {
 		args = append(args, "--json")
 	}
@@ -387,34 +386,14 @@ func (a *PgrollActivities) defaultBaseline(ctx context.Context, input types.Base
 }
 
 func parsePgrollStatusOutput(out []byte) (*types.MigrationStatus, error) {
-	var raw struct {
-		Name      string    `json:"name"`
-		Version   string    `json:"version"`
-		Status    string    `json:"status"`
-		Schema    string    `json:"schema"`
-		StartedAt time.Time `json:"started_at"`
-	}
-	dec := json.NewDecoder(bytes.NewReader(out))
-	if err := dec.Decode(&raw); err != nil {
+	var s types.MigrationStatus
+	if err := json.Unmarshal(out, &s); err != nil {
 		return nil, fmt.Errorf("parsing pgroll status output: %w", err)
 	}
-	status := &types.MigrationStatus{
-		Name:      strings.TrimSpace(raw.Name),
-		Version:   strings.TrimSpace(raw.Version),
-		Status:    strings.TrimSpace(raw.Status),
-		Schema:    strings.TrimSpace(raw.Schema),
-		StartedAt: raw.StartedAt,
-	}
-	if status.Version == "" {
-		status.Version = status.Name
-	}
-	if status.Name == "" {
-		status.Name = status.Version
-	}
-	if status.Status == "" {
+	if s.Status == "" {
 		return nil, fmt.Errorf("parsing pgroll status output: missing status")
 	}
-	return status, nil
+	return &s, nil
 }
 
 func normalizePgrollVersion(out []byte) string {
