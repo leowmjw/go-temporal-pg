@@ -1,0 +1,26 @@
+{
+  "operations": [
+    {
+      "add_column": {
+        "table": "users",
+        "up": "split_part(display_name, ' ', 1)",
+        "column": {
+          "name": "first_name",
+          "type": "varchar(255)",
+          "nullable": true
+        }
+      }
+    },
+    {
+      "add_column": {
+        "table": "users",
+        "up": "NULLIF(split_part(display_name, ' ', 2), '')",
+        "column": {
+          "name": "last_name",
+          "type": "varchar(255)",
+          "nullable": true
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "operations": [
+    {
+      "add_column": {
+        "table": "users",
+        "up": "'active'",
+        "column": {
+          "name": "status",
+          "type": "varchar(50)",
+          "nullable": false,
+          "default": "'active'"
+        }
+      }
+    }
+  ]
+}

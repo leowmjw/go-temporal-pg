@@ -2,359 +2,216 @@
 
 Temporal-based schema migration / CDC-stream / preview-clone package wrapping the
 `pgroll` and `pgstream` CLIs. Package layout: `internal/activities` (CLI wrappers),
-`internal/workflow` (Temporal workflows), `internal/types`, `cmd/pgschema` (worker entrypoint).
+`internal/workflow` (Temporal workflows), `internal/types`, `cmd/pgschema` (worker
+entrypoint), `cmd/pgschema-demo` (demo web UI), `demo/` (docker-compose + pgroll
+migration fixtures for the demo).
 
-## pgroll
+`go build ./...`, `go vet ./...`, `go test ./... -race` are green as of this pass.
+No CLAUDE.md exists at repo root or under `pgschema/` — this file is the only
+agent-facing guidance here.
 
-Status: **planning backlog**. The current pgroll integration covers the core migration lifecycle: validate, start, complete, rollback, and status. The gaps below capture additional pgroll capabilities and operational hardening that are not yet fully leveraged.
+## pgroll — roadmap gaps (status: planning backlog)
 
-### Main gaps
+Current integration covers validate/start/complete/rollback/status. Gaps below are
+real backlog, not yet implemented:
 
-| Gap | Why it matters | Suggested implementation direction | Acceptance criteria |
-|---|---|---|---|
-| No `pgroll init` / readiness check | Migrations assume pgroll has already been initialized in the target database. First-time runs can fail late if pgroll metadata is missing. | Add a preflight activity that verifies pgroll metadata exists for the configured database/schema. If missing, either fail with a clear message or optionally run `pgroll init` behind an explicit input flag such as `AllowInitialize`. | Workflow fails early with an actionable error when pgroll is not initialized. Optional init path is idempotent and covered by tests. |
-| No `baseline` flow | Existing production databases need a safe adoption path without replaying historical migrations. | Add a brownfield onboarding workflow/activity around `pgroll baseline`. Capture baseline name, migrations directory/path, schema, operator identity, and timestamp in logs/audit output. | A database with existing tables can be registered as a pgroll-managed schema without applying DDL. Tests cover successful baseline and already-baselined behavior. |
-| No `latest schema` integration | Application rollout needs to know which versioned schema to connect to during the expand phase. Today this appears to be handled outside the workflow. | Add an activity that runs `pgroll latest schema` and exposes the result through workflow progress/query output. Use it after `start` so deployment tooling can set `search_path` or equivalent app configuration. | After `StartMigration`, workflow progress includes the latest pgroll schema name. Tests verify it is available before waiting for app readiness. |
-| Status is only used after completion | Operators and automation cannot continuously compare Temporal’s phase with pgroll’s actual database state during the critical rollout window. | Poll or query pgroll status at phase boundaries: before start, after start, while waiting for app readiness, before complete, after complete, and after rollback. Store last observed pgroll status in progress response. | Progress query reports both Temporal phase and pgroll status/version. Workflow detects unexpected state and fails or escalates with a clear reason. |
-| No operation-level policy/risk analysis | All migration JSON is treated as equivalent. Risky changes such as raw SQL, renames, constraints, defaults, or large-table operations may need approval or scheduling controls. | Parse migration JSON before `validate`. Classify operations into risk levels. Add policy checks for raw SQL, renames, constraints, backfills/defaults, destructive operations, and operations targeting protected schemas/tables. | Validation returns a structured risk report. Configurable policy can block or require approval for high-risk operations. Unit tests cover representative pgroll operations. |
-| No runtime pgroll binary/version check | A missing or unexpected pgroll binary fails only when an activity executes. Different pgroll versions may support different operations or CLI flags. | Add startup or preflight check that runs `pgroll version` or equivalent. Compare against the expected pinned version from tooling. Include the observed version in logs and workflow metadata. | Worker/preflight fails fast if pgroll is missing. Version mismatch is visible and optionally fatal depending on configuration. |
-| No reconciliation/idempotency against pgroll state | Manual pgroll commands, worker crashes, retries, or partially completed activities can cause Temporal state and database state to diverge. | Add a reconciliation function that reads pgroll status before each mutating step and decides whether to no-op, continue, rollback, or fail. Keep command execution idempotent where possible. | Restarted workflows can resume safely from known pgroll states. Tests cover already-started, already-completed, rolled-back, and unknown/divergent states. |
+| Gap | Why it matters | Direction |
+|---|---|---|
+| No `pgroll init`/readiness check | First-time runs fail late if pgroll metadata is missing | Preflight activity; fail fast or gate behind `AllowInitialize` |
+| No `baseline` flow | Existing (brownfield) DBs need adoption without replaying history | Wrap `pgroll baseline`; log operator/timestamp. **Demo now exercises this at the CLI level (`mise run demo-init`) but no activity/workflow wraps it yet** |
+| No `latest schema` integration | App rollout needs the versioned schema name after `start` | Activity for `pgroll latest schema`; surface via progress query |
+| Status only checked after completion | Can't compare Temporal phase vs pgroll DB state mid-flight | Query status at each phase boundary; store last-observed in progress |
+| No operation-level risk/policy analysis | Raw SQL, renames, destructive ops all treated equally | Parse migration JSON pre-`validate`; classify risk; configurable block/approve gates |
+| No pgroll binary/version preflight | Missing/wrong binary fails only when an activity runs | `pgroll version` check at startup; compare to pinned version |
+| No reconciliation/idempotency vs pgroll state | Crash/retry can diverge Temporal state from DB state | Read pgroll status before each mutating step; no-op/continue/rollback/fail accordingly |
 
-### Suggested implementation order
+Notes: keep pgroll activities small/explicit; do all pgroll CLI/DB inspection in
+activities, never in workflow code (determinism); treat `init`/`baseline` as
+onboarding ops, not normal migration steps.
 
-1. **Preflight and version checks**
-   - Add pgroll binary existence/version check.
-   - Add pgroll metadata readiness check.
-   - Fail fast with actionable errors.
+## pgstream — roadmap gaps (status: planning backlog)
 
-2. **Status model expansion**
-   - Extend migration progress to include pgroll status/version/latest schema.
-   - Query status at every phase boundary.
-   - Add reconciliation helpers.
+Current integration: init metadata/slot, run a long-lived stream, stop via
+cancellation, poll lag, restart on anonymization-rule change. Keep this section
+separate from pgroll — different lifecycle. Gaps:
 
-3. **Latest schema support**
-   - Add `latest schema` activity.
-   - Surface latest schema through workflow query output.
-   - Document how deployment tooling should consume it.
+| Gap | Direction |
+|---|---|
+| No snapshot/backfill mode | Explicit `replication`/`snapshot`/`snapshot_and_replication` mode on `StreamConfig` |
+| No DDL/schema-change replication policy | `allow`/`block`/`alert_only`/`require_approval`, surfaced in status |
+| No table/schema include-exclude filtering | Filters on `StreamConfig` for multi-tenant/preview scoping |
+| No non-Postgres targets | Typed targets: postgres/kafka/opensearch/webhook; Postgres-to-Postgres stays default |
+| No config-file generation | Render typed config to a temp file instead of growing CLI flags; golden-file tests |
+| No pgstream binary/version preflight | Same shape as the pgroll one above |
+| Lag visibility too narrow | Add slot/LSN/connectivity/throughput/error-count to status |
+| No WAL/replication-slot guardrails | Max lag bytes/duration, max inactive slot duration, auto-escalate |
+| No idempotent slot/metadata reconciliation | Inspect slot before init/run; reuse/recreate/fail |
+| No dead-letter/failed-event strategy | retry/pause/skip/dead-letter/alert policy |
+| No anonymization/transformer validation | Validate table/column/transformer names before restart |
+| No explicit restart contract | Track restart reason/count/timestamp; rate-limit |
+| No multi-target fan-out | One workflow per target, or child workflows; decide failure isolation |
+| No metrics | `pgschema_pgstream_{lag_bytes,restarts_total,errors_total,events_total}` |
+| No secure generated-config handling | Redact DSNs in generated configs; restrictive temp-file perms; cleanup |
+| No real integration tests | Build-tagged tests against real Postgres + pgstream binary |
 
-4. **Brownfield onboarding**
-   - Add `baseline` activity/workflow.
-   - Add tests against an existing schema.
-   - Make onboarding explicit and separate from normal migration execution.
+Notes: long-running pgstream execution stays in activities; cancellation is the
+stop mechanism; preserve `ContinueAsNew` for unbounded history; never log raw DSNs
+or row-level data; replication slots left abandoned retain WAL on the source.
 
-5. **Policy/risk analysis**
-   - Parse migration JSON.
-   - Classify operation types and risk levels.
-   - Add configurable policy gates and approval hooks.
+## Fixed in past sessions (context for *why* code looks the way it does)
 
-6. **Operational hardening**
-   - Add audit-friendly structured logs for pgroll command, schema, migration name, status, version, and duration.
-   - Redact DSNs and secrets from all logs/errors.
-   - Add tests for command failures and malformed pgroll output.
+- **`activities/pgstream.go` `defaultGetLag`**: was a `return 0, nil` stub, now
+  parses `lag_bytes` via `parseLagBytes` (unit-tested).
+- **`PollLag`/`RunStream`**: heartbeat on a ticker while the long-running
+  poll/exec blocks, so `HeartbeatTimeout` doesn't fire on a healthy stream.
+- **`preview_db.go` `defaultClone`**: creates the target DB first, uses
+  `pg_dump --format=plain` (was `--format=custom`, which `psql` can't ingest —
+  silent failure), builds DSNs via `joinDBName`/`extractDBName` instead of naive
+  string concat (was corrupting keyword=value DSNs).
+- **`defaultApplyAnonymization`**: now actually marshals `input.Rules` into a
+  pgstream transformer config and passes `--config` (previously ignored rules
+  entirely).
+- **`redactDSN`**: walks a quoted `password='...'` to its real closing quote
+  instead of stopping at the first space (was leaking password tails).
+- **`AlertActivities.DefaultWebhookURL`**: used when `AlertMessage.WebhookURL` is
+  empty — every real caller leaves it empty, so without this no paging ever
+  happened. Wired from `PGSCHEMA_ALERT_WEBHOOK_URL` in `main.go`.
+- **Update handlers now actually wired**: `extend-wait` (`schema_migration.go`),
+  `extend-ttl` (`preview_clone.go`) drive real deadline loops instead of a fixed
+  timer; `update-anon-rules` (`cdc_stream.go`) triggers a `ContinueAsNew` restart
+  since the external pgstream process can't hot-reload.
+- **`cdc_stream.go` shutdown gap**: every exit path now cancels the run context
+  before receiving on `lagDone`, so that receive can't block for the full 7-day
+  `StartToCloseTimeout`. Was the most severe bug found in that pass (most of the
+  CDC test suite hung on it). Also: `RunStream`'s retry `MaximumAttempts` was `0`
+  (unlimited) — bounded to `20` so a permanently-failing stream's alert path is
+  reachable.
+- **Test-harness gotcha**: `TestWorkflowEnvironment.UpdateWorkflow(...)` queues
+  its callback async — asserting on `OnAccept`/`OnComplete` in the *same*
+  `RegisterDelayedCallback` body that called it reads stale zero-values. Always
+  split into two callbacks (issue update in one, assert in a later one).
+- **Duplication consolidated** (`activities/base.go`, `activities/dsn.go`):
+  `baseActivities{ log }` embedded by all 4 activity structs (was 4x copy-pasted
+  `logger()`); `redactDSN`/`baseConnStr`/`joinDBName`/`extractDBName` share one
+  `isURIForm` classifier; `runCommand(ctx, name, args, opts...)` is the one place
+  that shells out + wraps errors (was reimplemented 5 times). `runPgroll`/
+  `runPgstream*` are thin named wrappers over it. New activity types should embed
+  `baseActivities` and use `runCommand` rather than reimplementing either.
+- **Structured trace/flow logging** (`baseActivities.startTrace` in `base.go`):
+  every activity method and `runCommand` call emits matched `flow=start`/
+  `flow=end` log lines sharing a `trace_id`, with `elapsed` on the end line and
+  automatic `workflow_id`/`run_id`/`activity_id` via `activity.GetInfo` (safely
+  recovered outside real activity contexts). Not OpenTelemetry — just enough
+  structure for an agent/`jq` to reconstruct a run's timeline from logs alone.
+  Gaps: no downstream log-query consumer exists yet; `trace_id` is per-operation,
+  not per-workflow-run (no single ID threads one workflow execution end-to-end).
 
-### Notes for next agent
+## Real pgroll v0.16.2 CLI bugs found + fixed (discovered by running it, not by docs)
 
-- Keep pgroll lifecycle activities small and explicit. Prefer adding new activity methods rather than overloading existing validate/start/complete behavior.
-- Preserve Temporal determinism: do all pgroll CLI/database inspection inside activities, not directly in workflow code.
-- Treat `pgroll init` and `pgroll baseline` as onboarding/setup operations, not normal migration steps, unless explicitly requested by input.
-- The workflow should not assume that Temporal state is the source of truth after a retry or restart. Always reconcile against pgroll status before mutating.
-- For app rollout integration, the most useful missing artifact is the latest versioned schema name after `start`.
-- For safety, policy analysis should happen before `pgroll validate`/`start`, so blocked migrations fail before any DDL is attempted.
-- pgstream roadmap items should be added separately under a future `## pgstream` section.
+pgroll's actual CLI has drifted from common examples. All confirmed against the
+real binary (`pgroll --help`, and reading `pkg/mod/.../pgroll@v0.16.2/cmd/*.go`):
 
-## pgstream
+- Flag is `--postgres-url`, not `--dsn` — every pgroll invocation was previously a
+  CLI parse error. Fixed in `runPgroll`/`runPgrollOutput` (`base.go`) and the
+  `migrate-*` mise tasks.
+- `validate`/`start` take the migration file as a positional `<file>` argument,
+  **not stdin**. `runPgroll` now writes `migrationJSON` to a temp file and passes
+  its path.
+- `status` has no `--output`/`--json` flag — it always prints JSON. Dropped the
+  fake flag; `defaultStatus` now goes through `runPgrollOutput` (shared
+  `runCommand` + tracing) instead of a bespoke `exec.CommandContext` block.
+- `go install github.com/xataio/pgroll/cmd/pgroll@...` / `.../pgstream/cmd/
+  pgstream@...` 404 — both modules put `main()` at the module root, not under
+  `cmd/<name>`. Fixed `install-tools` to install the module root path.
+- Brownfield adoption needs `pgroll baseline <version> <dir>` (not just `init`)
+  before any migration will run against a schema pgroll didn't create — pgroll
+  errors with "non-empty but has no migration history" otherwise. `baseline`
+  requires a pre-existing target dir and writes a placeholder file there (for
+  manual `pg_dump` completion, per pgroll docs) — content unused by pgschema, only
+  the DB-side state it records matters. Demo points this at gitignored
+  `.data/pgroll-baseline/`.
+- Known, not fixed: `types.MigrationStatus.Name`/`StartedAt` don't exist in real
+  pgroll `status` JSON (`{schema, version, status}`) — always zero-valued. Only
+  `Status`/`Schema` are real. Harmless today since `schema_migration.go` only
+  checks `Status != "Complete"`, but don't assume `Name`/`StartedAt` are wired up.
 
-Status: **planning backlog**. Keep this section separate from `## pgroll`. The pgroll roadmap covers zero-downtime schema migration. This section covers CDC, replication, snapshotting, anonymization, and downstream streaming capabilities via pgstream.
+Validated end-to-end for real: all 6 demo migrations run start→complete against
+live Postgres 18 (see `demo/`), plus the exact `PgrollActivities` code path
+(`ValidateMigration`→`StartMigration`→`GetMigrationStatus`→`CompleteMigration`)
+exercised directly against a live DB in a throwaway test.
 
-The current pgstream integration covers a basic CDC lifecycle:
+## Local dev loop (`mise.toml`, `.air*.toml`, `Procfile`)
 
-- initialize pgstream metadata / replication slot
-- run a long-lived stream
-- stop via Temporal cancellation
-- poll replication lag
-- restart the workflow when anonymization rules change
+- `[env]` in `mise.toml`: `_.file = ".env"` loads `pgschema/.env` (copy from
+  `.env.sample`) into every task/mise-activated shell; `_.path` prepends
+  `~/go/bin` so `go install`-ed binaries (pgroll, pgstream) are found.
+- `air` (`.air.toml` for the worker, `.air-demo.toml` for the demo web UI)
+  rebuilds+restarts on `.go`/`.json` changes. Field names verified against
+  `air init`'s generated default config (don't trust memory for air's schema,
+  verify against `air init` output if unsure). Key fields for clean shutdown:
+  `send_interrupt = true` (send SIGINT to the child, not just kill it — air
+  treats SIGINT and SIGTERM the same for its own shutdown, which matters because
+  overmind's default stop signal is SIGTERM), `kill_delay` (grace period before
+  hard kill), `misc.clean_on_exit = true` (removes `tmp/` build output). Don't
+  set `full_bin` unless it needs to differ from `bin` — leaving it equal to `bin`
+  is a no-op, just noise.
+- `overmind` (`Procfile`) runs postgres + temporal + worker + demo web together:
+  `mise run dev`. The `postgres` line is `sh -c 'trap "docker compose ... down"
+  EXIT; docker compose ... up'` — guarantees the container+network are actually
+  torn down (not just left stopped) on any exit (Ctrl-C, `overmind quit`,
+  SIGTERM), while the *named volume* survives (down has no `-v`), so baselined
+  demo data persists across `mise run dev` restarts. Verified for real: sent
+  SIGTERM to the wrapped process, confirmed container+network removed within
+  ~2s, then confirmed the volume/data survived a subsequent `docker compose up`.
+  `mise run dev` passes `overmind start --timeout 15` (default is 5s) so Docker
+  has enough grace period to actually finish before a hard SIGKILL.
+- `mise run doctor` checks air/overmind/go/temporal/docker/pgroll/pgstream/`.env`
+  presence with fix hints. `temporal` itself is assumed pre-installed standalone
+  (not a mise tool).
+- `cmd/pgschema/main.go`'s `client.Dial` reads `TEMPORAL_ADDRESS`/
+  `TEMPORAL_NAMESPACE` from env (empty keeps SDK defaults).
 
-The gaps below capture broader pgstream capabilities that are not yet fully leveraged.
+**Sandbox quirk (this agent environment specifically, not pgschema itself)**:
+backgrounding a long-running Go daemon (`go run ./cmd/pgschema`, plain `air`,
+`temporal server start-dev`, etc.) via `&`/`disown`, `nohup`, or the Bash tool's
+`run_in_background` was observed getting reaped within ~3-5s regardless of
+method, logging a clean start-then-immediate-stop with no error — looks exactly
+like the process received SIGINT/SIGTERM instantly. A genuine OS-level daemon
+(`docker compose up` under a real docker daemon) was *not* affected and ran
+fine in the background. If you need to verify a long-running Go process's
+behavior in this environment and backgrounding it gets silently killed, don't
+fight it — instead exercise the exact code path directly (e.g. a throwaway
+`_test.go` in the target package calling the real functions against a live
+dependency) rather than trying to keep a full server alive across tool calls.
 
-### Main gaps
+## pgroll workflow demo (`demo/`, `cmd/pgschema-demo/`)
 
-| Gap | Why it matters | Suggested implementation direction | Acceptance criteria |
-|---|---|---|---|
-| No explicit snapshot / backfill mode support | CDC pipelines usually need an initial copy of existing data before streaming new changes. Without first-class snapshot support, targets may start incomplete unless manually seeded. | Extend stream configuration with an explicit mode: `replication`, `snapshot`, or `snapshot_and_replication`. Add fields for snapshot scope, table filters, repeatability, batch sizing, and snapshot-only execution. | Workflow can run snapshot-only and snapshot-then-replication pipelines. Tests cover empty target, existing target, and snapshot failure before streaming begins. |
-| No first-class DDL / schema-change replication policy | pgstream can support schema-change-aware replication, but production systems need control over which schema changes are allowed to propagate automatically. | Add schema-change policy configuration: `allow`, `block`, `alert_only`, or `require_approval`. Surface DDL/schema events in workflow status and alerts. | DDL events are visible to operators. Configurable policy can block or alert on risky schema changes. Tests cover allowed and blocked schema-change events. |
-| No table / schema / object include-exclude filtering | Many CDC pipelines should replicate only selected data, especially for multi-tenant, privacy, cost, or preview-environment scenarios. | Add filters to stream configuration: included schemas, excluded schemas, included tables, excluded tables, object types, and glob/pattern support where pgstream supports it. | A stream can be scoped to specific tables/schemas. Invalid or conflicting filters fail validation before starting pgstream. |
-| No non-Postgres target support | Current usage is Postgres-to-Postgres focused, but pgstream can be useful for Kafka, Elasticsearch/OpenSearch, webhooks, search indexing, eventing, and fan-out pipelines. | Generalize target configuration with typed targets: `postgres`, `kafka`, `opensearch`, `elasticsearch`, and `webhook`. Keep Postgres-to-Postgres as the first supported production path while designing the model for extension. | Existing Postgres-to-Postgres behavior remains compatible. Configuration can represent at least one additional target type without changing workflow signatures again. |
-| No generated config-file workflow | Advanced pgstream use cases are easier to express and test via config files than via a growing list of CLI flags. | Add a pgstream config renderer that turns typed stream configuration into a temporary config file. Unit-test rendering independently from process execution. | Config rendering has golden-file tests. New pgstream options can be added by extending config structs instead of hand-building many ad-hoc CLI flags. |
-| No pgstream binary / version preflight | A missing or wrong pgstream binary will fail late inside the workflow. Version mismatches can change supported flags and config syntax. | Add a preflight activity that checks pgstream is installed and records its version. Compare against the expected pinned version from tooling. Support strict and warning-only modes. | Workflow fails fast with an actionable error if pgstream is unavailable. Version is included in structured logs/status. Optional strict mode fails on mismatch. |
-| Lag visibility is too narrow | A single lag value is not enough for production operations. Operators also need source health, target health, slot status, LSN position, last event timestamp, error counts, and throughput. | Expand stream status to include lag bytes, slot name, current LSN, last processed event time, source connectivity, target connectivity, batch counts, retry counts, and recent errors where available. | Workflow query returns a richer CDC status object. Alerts distinguish between lag, source failure, target failure, and stalled replication. |
-| No WAL / replication-slot safety guardrails | Stalled replication slots can retain WAL indefinitely and create source database risk. | Add configurable guardrails: max lag bytes, max lag duration, max inactive slot duration, and optional automatic escalation/stop behavior. | Workflow escalates or stops when thresholds are exceeded. Tests cover lag threshold breach, recovery, and repeated polling failures. |
-| No idempotent slot / metadata reconciliation | Existing replication slots, stale pgstream metadata, or partial previous runs can cause startup conflicts. | Add reconciliation before init/run: inspect pgstream metadata, check replication slot existence, verify slot ownership, and decide whether to reuse, recreate, or fail. | Restarted workflows handle already-initialized, stale-slot, and conflicting-slot cases predictably. |
-| No dead-letter / failed-event strategy | CDC streams need a plan for events that cannot be applied downstream due to constraints, schema mismatch, serialization errors, webhook failures, or target outages. | Add a failure policy: retry, pause, skip with audit, write to dead-letter target, or alert. Surface failed-event metadata safely without leaking secrets or sensitive row values. | Target apply failures produce deterministic workflow behavior. Operators can see why the stream paused/failed and where rejected events were recorded. |
-| No deep anonymization / transformation validation | Runtime anonymization updates are accepted structurally, but rules should be validated against source schema and supported transformer names/options before restarting a stream. | Add validation for table existence, column existence, transformer names, transformer options, duplicate/conflicting rules, and protected columns. | Invalid anonymization updates are rejected before stream restart. Tests cover unknown table, unknown column, unknown transformer, duplicate rules, and protected-field violations. |
-| No explicit restart contract for config updates | Updating anonymization rules requires a restart. That behavior should be visible and controlled rather than implicit. | Track restart reason, restart count, last restart timestamp, and restart initiator. Add restart rate limits. If pgstream later supports hot reload, hide that behind a reload/restart abstraction. | Workflow status shows when the stream restarted and why. Excessive restarts trigger alerting or rejection. |
-| No multi-target fan-out orchestration | A single source may need to feed multiple downstream systems, each with independent failure behavior. | Support either one workflow per target or one workflow coordinating child workflows per target. Decide whether target failures are isolated or fatal to the whole stream. | One source can replicate to multiple configured targets with independent status and failure policy per target. |
-| No operational metrics integration | Temporal lag queries are useful, but production monitoring should not require querying Temporal directly. | Emit metrics such as `pgschema_pgstream_lag_bytes`, `pgschema_pgstream_restarts_total`, `pgschema_pgstream_errors_total`, `pgschema_pgstream_events_total`, and `pgschema_pgstream_target_latency_ms`. | Metrics are emitted with safe labels such as stream ID, source name, and target type. Secrets are never exposed in labels or logs. |
-| No secure generated-config handling | Source and target URLs can contain credentials. Generated config files and command errors can leak secrets if not handled carefully. | Add shared DSN/config redaction. Prefer environment-variable or secret-reference interpolation where possible. Ensure temporary config files use restrictive permissions and are deleted after use. | No logs/errors expose credentials. Temp config files are created with restrictive permissions and cleaned up. Tests cover DSN redaction and config cleanup. |
-| No real pgstream integration tests for advanced modes | Unit tests validate workflow behavior, but snapshotting, replication, schema changes, and transformations need real Postgres/pgstream coverage. | Add build-tagged integration tests using local Postgres containers and the real pgstream binary. Start with Postgres-to-Postgres snapshot-and-replication. Add DDL and anonymization tests later. | Integration test proves initial copy, ongoing DML replication, cancellation, restart, and at least one schema-change path. |
+`demo/README.md` is the presenter walkthrough — read that first for the full
+script. `demo/docker-compose.yml` runs throwaway Postgres 18 (note: PG18's
+official image changed its volume convention — mount `/var/lib/postgresql`, the
+parent dir, not `.../data`, or the container refuses to start with "data in
+/var/lib/postgresql/data (unused mount/volume)"), seeded via plain SQL
+(`demo/init/`) with a brownfield `users` table. `mise run demo-reset` baselines
+it into pgroll; `demo/migrations/*.json` holds 6 real pgroll migrations, basic →
+complex, ending in a Postgres-18 `uuidv7()` bonus (all validated live, see
+above).
 
-### Suggested implementation order
-
-1. **Preflight and safety**
-    - Add pgstream binary/version check.
-    - Validate source and target connectivity.
-    - Reconcile pgstream metadata and replication slot state.
-    - Add max-lag / WAL-retention guardrails.
-
-2. **Configuration model expansion**
-    - Add explicit stream mode: `snapshot`, `replication`, `snapshot_and_replication`.
-    - Add table/schema/object filters.
-    - Preserve the current Postgres-to-Postgres path as the default supported mode.
-
-3. **Config-file generation**
-    - Implement typed pgstream config rendering.
-    - Add golden-file tests for generated configs.
-    - Prefer config-driven execution over adding many new CLI flags.
-
-4. **Snapshot support**
-    - Add snapshot-only workflow path.
-    - Add snapshot-then-replication workflow path.
-    - Track snapshot phase, tables completed, rows copied if pgstream exposes that detail, and failure state.
-
-5. **Schema-change handling**
-    - Surface schema-change/DDL events in stream status.
-    - Add policy modes: `allow`, `block`, `alert_only`, `require_approval`.
-    - Add tests for schema changes during active streams.
-
-6. **Transformation and anonymization hardening**
-    - Validate rules against the source schema.
-    - Validate transformer names and options.
-    - Make restart behavior explicit and auditable.
-    - Add restart rate limits.
-
-7. **Target expansion**
-    - Add typed configuration for Kafka, OpenSearch/Elasticsearch, and webhook targets.
-    - Start with validation/config rendering first.
-    - Add real end-to-end tests only after Postgres-to-Postgres advanced mode is stable.
-
-8. **Observability**
-    - Expand the lag query into a full stream-health query.
-    - Emit metrics and structured logs.
-    - Add alerting thresholds for lag, stalled streams, failed targets, and repeated restarts.
-
-9. **Integration testing**
-    - Add build-tagged real pgstream tests.
-    - Cover snapshot, replication, DDL propagation, anonymization, cancellation, restart, and lag threshold behavior.
-
-### Notes for next agent
-
-- Keep this section separate from `## pgroll`; do not merge the two roadmaps.
-- pgroll is for schema migration lifecycle. pgstream is for CDC, snapshots, replication, transformations, and downstream streaming.
-- Keep long-running pgstream execution inside activities. Workflow code must remain deterministic.
-- Treat cancellation as the primary stop mechanism unless pgstream adds a reliable external stop command.
-- Preserve `ContinueAsNew` behavior for long-running streams so workflow history does not grow without bound.
-- Prefer config-file generation over expanding command-line argument construction indefinitely.
-- Be careful with replication slots: abandoned or stalled slots can retain WAL on the source database.
-- Treat anonymization and transformation configuration as security-sensitive.
-- Do not log raw DSNs, generated configs with secrets, or row-level data.
-- For multi-target support, decide whether target failures are isolated per target or fatal to the entire stream.
-- Add integration tests incrementally. Start with local Postgres-to-Postgres snapshot-and-replication before adding Kafka/OpenSearch/webhook fixtures.
-
-### Previous Findings ..
-
-Everything that used to be listed here as a "known stub / broken path" or "update
-handler that doesn't do anything" has been fixed and has a regression test proving
-it (see the `*_test.go` file next to each source file). `go build ./...`, `go vet
-./...`, and `go test ./... -race` are all green as of this pass. Treat this file as
-a map of *why* each area looks the way it does, not a list of open work.
-
-- **`activities/pgstream.go` `defaultGetLag`** — was a hardcoded `return 0, nil`
-  stub; now parses `lag_bytes` from `pgstream status --output json` via the
-  extracted, unit-tested `parseLagBytes` helper.
-- **`activities/pgstream.go` `PollLag` / `RunStream`** — now call `safeHeartbeat`
-  on a ticker while the long-running poll/exec is in flight, so Temporal's
-  `HeartbeatTimeout: 2*time.Minute` (set in `cdc_stream.go`) doesn't fire against a
-  healthy stream. `defaultRun` uses the new `runPgstreamHeartbeating` helper
-  (`Start()`+`Wait()` + ticker) instead of a single blocking `CombinedOutput()`.
-  Covered by `TestRunStream_HeartbeatsWhileRunFnBlocks` / `TestPollLag_Heartbeats`.
-- **`activities/preview_db.go` `defaultClone`** — now creates the target database
-  first (`CREATE DATABASE`), uses `pg_dump --format=plain` (was `--format=custom`,
-  a binary archive that only `pg_restore` can read — `psql` was silently getting
-  fed a format it can't ingest), and builds the target DSN via the new
-  `joinDBName` helper instead of naive `baseConnStr+"/"+dbName`, which corrupted
-  keyword=value DSNs. `defaultDrop` uses the same helper so cleanup can always
-  recover the db name via `extractDBName`. Covered by `TestJoinDBName` /
-  `TestJoinDBName_RoundTripsThroughExtractDBName`.
-- **`activities/preview_db.go` `defaultApplyAnonymization`** — now marshals
-  `input.Rules` into a pgstream transformer config (`marshalAnonymizationConfig`),
-  writes it to a temp file, and passes `--config`; previously ignored `input.Rules`
-  entirely. Covered by `TestMarshalAnonymizationConfig`.
-- **`activities/pgroll.go` `redactDSN`** — now walks a single-quoted
-  `password='...'` value to its real closing quote instead of stopping at the
-  first whitespace, which used to leak the tail of a quoted password containing
-  spaces. Covered by `TestRedactDSN_QuotedPasswordWithSpace`.
-- **`activities/alert.go` `defaultPage`** — `AlertActivities` now has a
-  `DefaultWebhookURL` field used when `AlertMessage.WebhookURL` is empty (every
-  real caller — `pageOperator` in the workflow package — builds `AlertMessage`
-  without ever setting it). `cmd/pgschema/main.go` wires it from
-  `PGSCHEMA_ALERT_WEBHOOK_URL`. Covered by
-  `TestPage_DefaultWebhookURL_UsedWhenMessageEmpty`.
-
-## Update handlers — now actually wired
-
-- `schema_migration.go` **`extend-wait`** — the handler sends the extension
-  through a buffered `extendWaitCh`; the Step-3 wait is now a loop that recomputes
-  `remaining` against a `waitDeadline` and recreates its timer on every extension,
-  instead of a single fixed 60-minute `workflow.NewTimer`. Covered by
-  `TestUpdateHandler_ExtendWait_ActuallyDelaysRollback` (asserts the workflow is
-  still running well past the *original* deadline once extended).
-- `preview_clone.go` **`extend-ttl`** — same pattern via `extendTTLCh` driving a
-  `ttlDeadline` loop in Step 5, so the real drop timer moves, not just the
-  query-visible `endpoint.ExpiresAt`. Covered by
-  `TestUpdateHandler_ExtendTTL_ActuallyDelaysDrop`.
-- `cdc_stream.go` **`update-anon-rules`** — `RunStream` wraps an external
-  process that can't be hot-reloaded, so there's no way to make an in-place
-  update take effect. The handler now sends to `restartCh`; Step 4's loop treats
-  that as a third exit condition (alongside `stopped`/`streamErr`) and, when nothing
-  else has already claimed the exit, cancels the run and `ContinueAsNew`s with the
-  updated `cfg` so the fresh run's `RunStream` actually picks up the new rules.
-  Covered by `TestUpdateAnonymizationRules_TriggersRestart`. Note:
-  `TestUpdateAnonymizationRules_Valid` no longer also sends a stop signal — the
-  restart races it out first, which is the new correct behavior, not a test bug.
-
-## Shutdown / cancellation gap — fixed
-
-`cdc_stream.go` now derives `runCtx, cancelRun := workflow.WithCancel(ctx)` and
-schedules both `RunStream` and the lag-polling `PollLag` goroutine under it.
-Every exit path (`stopped`, `streamErr`, `restart`, and the `MaxIterations`
-`ContinueAsNew`) calls `cancelRun()` before `lagDone.Receive(ctx, nil)`, so that
-receive can no longer block for up to the 7-day `StartToCloseTimeout`. Covered by
-`TestHappyPath_StopSignal` (previously hung/failed on `test timeout: 3s` — this
-was the most severe bug found: most of the CDC test suite failed on this before
-the fix).
-
-Related, separately-discovered bug fixed in the same file: `RunStream`'s
-`RetryPolicy.MaximumAttempts` was `0` (unlimited). Combined with the shutdown fix
-this became directly observable — a permanently-failing stream retried forever
-and `streamFuture` never resolved, so the "stream died → alert operator" path was
-unreachable no matter how badly the stream failed. Now bounded at `20`. Covered by
-`TestStreamDies_AlertFired`.
-
-## Test-harness gotcha (not a production bug, but will bite you)
-
-`TestWorkflowEnvironment.UpdateWorkflow(...)` queues the update handler's
-invocation as an internal callback (`env.postCallback(fn, true)`) — it does **not**
-run synchronously before `UpdateWorkflow` returns. Asserting on the
-`TestUpdateCallback`'s `OnAccept`/`OnReject`/`OnComplete` results in the *same*
-`RegisterDelayedCallback` body that called `UpdateWorkflow` reads stale
-(zero-value) state, because that queued callback is only drained *after* the
-current one returns. Every Update-handler test in this package now follows the
-two-callback pattern: one callback issues `UpdateWorkflow` and captures results
-into outer-scoped variables; a second, later-scheduled callback asserts on them.
-If you add a new Update-handler test, follow the same split or it will silently
-assert on empty/zero values instead of the real outcome.
-
-## Duplication that could still be consolidated — fixed
-
-All three items below are now consolidated in `internal/activities/base.go` and
-`internal/activities/dsn.go`; every activity struct embeds the shared type
-instead of reimplementing it.
-
-- `logger()` nil-fallback used to be copy-pasted identically across all 4
-  activity structs. Now `baseActivities{ log *slog.Logger }` is embedded (by
-  value) into `AlertActivities`, `PgrollActivities`, `PgstreamActivities`, and
-  `PreviewDBActivities`, and `logger()` is defined once on `baseActivities`.
-  Constructors set it via `baseActivities: baseActivities{log: log}`; test
-  literals use the same nested-struct form (see `newTestPgrollActivities` and
-  friends).
-- DSN parsing (URI vs keyword=value) was independently reimplemented in
-  `redactDSN` (`pgroll.go`) and `baseConnStr`/`extractDBName`/`joinDBName`
-  (`preview_db.go`). All four now live together in `dsn.go` and share one
-  `isURIForm` classifier instead of each re-deriving the `strings.Contains(dsn,
-  "://")` check.
-- `exec.CommandContext` + wrap-error-with-output was reimplemented as
-  `runPgroll`, `runPgstream`, `runPgstreamOutput`, `runPgstreamHeartbeating`,
-  and inline calls in `defaultClone`/`defaultDrop`. All of that now goes
-  through one `baseActivities.runCommand(ctx, name, args, opts...)`, configured
-  via `withStdin`, `withStdoutOnly`, `withHeartbeat(msg)`. `runPgroll` /
-  `runPgstream` / `runPgstreamOutput` / `runPgstreamHeartbeating` still exist
-  as thin named wrappers around `runCommand` (kept because call sites read
-  better as `a.runPgroll(...)` than `a.runCommand(ctx, "pgroll", ...)`), but
-  there is now exactly one place that builds the command, captures output, and
-  formats the wrapped error. The one exception is `defaultClone`'s
-  `pg_dump | psql` pipe, which needs `StdoutPipe`/`Start`/`Wait` across two
-  processes and doesn't fit `runCommand`'s single-process shape — it stays
-  manual but is traced through the same `startTrace` helper described below.
-
-If adding a new activity type, embed `baseActivities` and use `runCommand`
-(or the `runPgroll`/`runPgstream*` wrappers) rather than reimplementing either.
-
-## Structured trace/flow logging — foundation for agentic log analysis
-
-`baseActivities.startTrace(ctx, op, attrs...)` (in `base.go`) is a small,
-tracer-shaped wrapper around `slog` that every activity method and every
-`runCommand` call now uses. It exists so an agent (or a human with `jq`) can
-reconstruct what a workflow run actually did — order, duration, success/
-failure, causal grouping — by reading the worker's structured log stream
-alone, without standing up a separate tracing backend. This is intentionally
-*not* OpenTelemetry: it's the minimum structure needed for log-based flow
-reconstruction, layered on the logging pgschema already has.
-
-Shape of each pair of log lines:
-
-```json
-{"msg":"pgroll.start","flow":"start","op":"pgroll.start","trace_id":"...","schema":"public","workflow_id":"...","run_id":"...","activity_id":"..."}
-{"msg":"pgroll.start","flow":"end","op":"pgroll.start","trace_id":"...","elapsed":172000,"workflow_id":"...","run_id":"...","activity_id":"..."}
-```
-
-- `flow` is always `"start"` or `"end"` — group/filter on this to find
-  unterminated operations (crashed activity, still-running command).
-- `trace_id` is a random UUID generated once per `startTrace` call and shared
-  by its start/end line, so retries and concurrent activities never get their
-  start/end lines cross-matched.
-- `op` names are dotted (`pgroll.start`, `pgstream.run`, `preview.clone`,
-  `exec.pgroll`, `exec.psql`, ...) so an agent can filter by subsystem.
-  `exec.<binary>` lines come from `runCommand` and additionally carry a
-  `args` field that has been passed through `redactArgs` (DSNs redacted via
-  `redactDSN`), so raw commands are visible without leaking credentials.
-- `elapsed` (a `time.Duration`) is only present on the end line.
-- `workflow_id`/`run_id`/`activity_id` are added automatically from
-  `activity.GetInfo(ctx)` when running as a real Temporal activity; the
-  lookup is recovered from panic and silently omitted outside an activity
-  context (e.g. a unit test calling an activity method directly), so
-  `startTrace` is always safe to call in tests too.
-- On error, the end line is logged at `Error` level with an `error` field
-  instead of the normal `Info` level, so an agent scanning for failures can
-  filter on `level=ERROR AND flow=end` and read the paired `start` line (same
-  `trace_id`) for the inputs that led to it.
-
-### Where this could go next (not yet done)
-
-- No log *sink*/query layer exists yet — this only standardizes the shape of
-  the log lines the worker already emits to its configured `slog.Logger`.
-  Turning this into actual "agentic trace + flow analysis" needs something
-  downstream (e.g. shipping JSON logs to a queryable store) to read
-  `trace_id`/`flow`/`op`/`workflow_id` and reconstruct/visualize the DAG of a
-  run; that consumer does not exist in this repo yet.
-- `trace_id` is per-operation, not per-workflow-run. There is no single ID
-  that threads together every `startTrace` call within one Temporal workflow
-  execution (that role is currently played by `workflow_id`+`run_id`
-  together, which is coarser and doesn't let you order steps within a single
-  attempt as cleanly as a dedicated parent/child span ID would). If deeper
-  trace analysis is needed later, consider passing a per-run trace/span ID
-  through `context.Context` (workflow-safe: derive it deterministically from
-  `workflow.GetInfo(ctx).WorkflowExecution` inside workflow code, since a
-  random ID generated in workflow code would break Temporal determinism —
-  `uuid.NewString()` inside `startTrace` is only safe here because
-  `startTrace` is only ever called from activity code, never workflow code).
+`cmd/pgschema-demo` is a standalone web server (stdlib `net/http` +
+[Datastar](https://data-star.dev) v1.0.2 — verified there is no released v2, the
+"v2-style" `datastar-patch-*` wire protocol is what v1.0.2 actually ships,
+CDN-loaded, no JS build step) that starts a real `SchemaMigrationWorkflow` per
+scenario click and streams `migration-progress` + phase transitions back over
+SSE, with buttons for the real `app-ready`/`rollback` signals. Only imports
+`internal/workflow`/`internal/types` — no activity/workflow logic duplicated.
+SSE wire-format exactness is pinned by `TestSSEWireFormat`
+(`cmd/pgschema-demo/main_test.go`); template rendering by `TestIndexRenders`.
 
 ## Misc
 
-- No CLAUDE.md exists at repo root or under `pgschema/` — this file is the only
-  agent-facing guidance for this package.
-- Watch out for this session's environment auto-redacting literal secret-shaped
-  substrings (e.g. a `scheme://user:pass@host` URI) in tool-written file content —
-  a test literal that should contain `://` can silently come out as `******` with
-  the `://` marker gone, breaking string-form-detection logic under test. If a
-  DSN-parsing test fails in a way that looks like the wrong branch was taken,
-  `grep` the actual file content for the literal you meant to write before
-  assuming the parsing code is wrong.
+- This session's environment auto-redacts literal secret-shaped substrings
+  (e.g. `scheme://user:pass@host`) in tool-written file content — a test literal
+  containing `://` can silently come out as `******` with the marker gone,
+  breaking string-form-detection logic under test. If a DSN-parsing test fails
+  in a way that looks like the wrong branch was taken, `grep` the actual file
+  content for the literal you meant to write before assuming the parsing code
+  is wrong.

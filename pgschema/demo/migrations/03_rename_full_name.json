@@ -1,0 +1,11 @@
+{
+  "operations": [
+    {
+      "rename_column": {
+        "table": "users",
+        "from": "full_name",
+        "to": "display_name"
+      }
+    }
+  ]
+}

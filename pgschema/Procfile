@@ -1,0 +1,4 @@
+postgres: sh -c 'trap "docker compose -f demo/docker-compose.yml down" EXIT; docker compose -f demo/docker-compose.yml up'
+temporal: temporal server start-dev --db-filename .data/temporal.db --ui-port 8233
+worker: air -c .air.toml
+web: air -c .air-demo.toml
