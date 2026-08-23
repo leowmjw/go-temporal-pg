@@ -268,7 +268,7 @@ type LagResponse struct {
 
 type SnapshotStatus struct {
 	Phase           string    `json:"phase,omitempty"`
-	TablesCompleted int       `json:"tables_completed,omitempty"`
+	TablesCompleted int64     `json:"tables_completed,omitempty"`
 	RowsCopied      int64     `json:"rows_copied,omitempty"`
 	StartedAt       time.Time `json:"started_at,omitempty"`
 	CompletedAt     time.Time `json:"completed_at,omitempty"`

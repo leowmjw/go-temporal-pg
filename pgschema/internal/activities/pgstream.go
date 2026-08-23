@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -1096,14 +1095,8 @@ func mergeHealthFromStatus(health *types.StreamHealthResponse, status map[string
 	if rows, ok := lookupInt64(status, "rows_copied"); ok {
 		health.Snapshot.RowsCopied = rows
 	}
-	if tables, ok := lookupInt64(status, "tables_completed"); ok {
-		if tables < 0 {
-			health.Snapshot.TablesCompleted = 0
-		} else if tables > int64(math.MaxInt) {
-			health.Snapshot.TablesCompleted = math.MaxInt
-		} else {
-			health.Snapshot.TablesCompleted = int(tables)
-		}
+	if tables, ok := lookupInt64(status, "tables_completed"); ok && tables >= 0 {
+		health.Snapshot.TablesCompleted = tables
 	}
 }
 
