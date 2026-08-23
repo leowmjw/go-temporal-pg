@@ -16,13 +16,34 @@ import (
 	"github.com/leowmjw/go-temporal-pg/pgactive/internal/types"
 )
 
-// RDSClient interface for mocking AWS RDS operations
-type RDSClient interface {
-	DescribeDBInstances(ctx context.Context, params *rds.DescribeDBInstancesInput, optFns ...func(*rds.Options)) (*rds.DescribeDBInstancesOutput, error)
-	CreateDBInstance(ctx context.Context, params *rds.CreateDBInstanceInput, optFns ...func(*rds.Options)) (*rds.CreateDBInstanceOutput, error)
-	ModifyDBParameterGroup(ctx context.Context, params *rds.ModifyDBParameterGroupInput, optFns ...func(*rds.Options)) (*rds.ModifyDBParameterGroupOutput, error)
-	RebootDBInstance(ctx context.Context, params *rds.RebootDBInstanceInput, optFns ...func(*rds.Options)) (*rds.RebootDBInstanceOutput, error)
-	DeleteDBInstance(ctx context.Context, params *rds.DeleteDBInstanceInput, optFns ...func(*rds.Options)) (*rds.DeleteDBInstanceOutput, error)
+// RDSClientFuncs holds function fields for AWS RDS operations, allowing injection without an interface.
+type RDSClientFuncs struct {
+	DescribeDBInstances    func(ctx context.Context, params *rds.DescribeDBInstancesInput, optFns ...func(*rds.Options)) (*rds.DescribeDBInstancesOutput, error)
+	CreateDBInstance       func(ctx context.Context, params *rds.CreateDBInstanceInput, optFns ...func(*rds.Options)) (*rds.CreateDBInstanceOutput, error)
+	ModifyDBParameterGroup func(ctx context.Context, params *rds.ModifyDBParameterGroupInput, optFns ...func(*rds.Options)) (*rds.ModifyDBParameterGroupOutput, error)
+	RebootDBInstance       func(ctx context.Context, params *rds.RebootDBInstanceInput, optFns ...func(*rds.Options)) (*rds.RebootDBInstanceOutput, error)
+	DeleteDBInstance       func(ctx context.Context, params *rds.DeleteDBInstanceInput, optFns ...func(*rds.Options)) (*rds.DeleteDBInstanceOutput, error)
+}
+
+// NewRDSClientFuncs wraps a real *rds.Client into an RDSClientFuncs struct.
+func NewRDSClientFuncs(c *rds.Client) RDSClientFuncs {
+	return RDSClientFuncs{
+		DescribeDBInstances:    c.DescribeDBInstances,
+		CreateDBInstance:       c.CreateDBInstance,
+		ModifyDBParameterGroup: c.ModifyDBParameterGroup,
+		RebootDBInstance:       c.RebootDBInstance,
+		DeleteDBInstance:       c.DeleteDBInstance,
+	}
+}
+
+// describeDBInstancesAdapter adapts the DescribeDBInstances function field to satisfy
+// the rds.DescribeDBInstancesAPIClient interface required by the SDK waiters.
+type describeDBInstancesAdapter struct {
+	fn func(ctx context.Context, params *rds.DescribeDBInstancesInput, optFns ...func(*rds.Options)) (*rds.DescribeDBInstancesOutput, error)
+}
+
+func (a *describeDBInstancesAdapter) DescribeDBInstances(ctx context.Context, params *rds.DescribeDBInstancesInput, optFns ...func(*rds.Options)) (*rds.DescribeDBInstancesOutput, error) {
+	return a.fn(ctx, params, optFns...)
 }
 
 // HealthCheckError represents a health check failure
@@ -40,13 +61,13 @@ func NewHealthCheckError(message string) *HealthCheckError {
 
 // Activities provides all workflow activities
 type Activities struct {
-	RDS           RDSClient
+	RDS           RDSClientFuncs
 	SecretsClient *secretsmanager.Client
 	Log           *slog.Logger
 }
 
 // NewActivities creates a new Activities instance
-func NewActivities(rdsClient RDSClient, secretsClient *secretsmanager.Client, logger *slog.Logger) *Activities {
+func NewActivities(rdsClient RDSClientFuncs, secretsClient *secretsmanager.Client, logger *slog.Logger) *Activities {
 	return &Activities{
 		RDS:           rdsClient,
 		SecretsClient: secretsClient,
@@ -173,7 +194,7 @@ func (a *Activities) ProvisionTargetDB(ctx context.Context, input types.UpgradeI
 	}
 
 	// Wait for DB to become available
-	waiter := rds.NewDBInstanceAvailableWaiter(a.RDS)
+	waiter := rds.NewDBInstanceAvailableWaiter(&describeDBInstancesAdapter{fn: a.RDS.DescribeDBInstances})
 	err = waiter.Wait(ctx, &rds.DescribeDBInstancesInput{
 		DBInstanceIdentifier: aws.String(targetDBID),
 	}, 15*time.Minute)
@@ -251,7 +272,7 @@ func (a *Activities) ConfigurePgactiveParams(ctx context.Context, input types.Ac
 		}
 
 		// Wait for instance to become available again
-		waiter := rds.NewDBInstanceAvailableWaiter(a.RDS)
+		waiter := rds.NewDBInstanceAvailableWaiter(&describeDBInstancesAdapter{fn: a.RDS.DescribeDBInstances})
 		err = waiter.Wait(ctx, &rds.DescribeDBInstancesInput{
 			DBInstanceIdentifier: aws.String(dbID),
 		}, 10*time.Minute)

@@ -5,24 +5,41 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"sync/atomic"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
 	"github.com/aws/aws-sdk-go-v2/service/rds/types"
-	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/leowmjw/go-temporal-pg/pgactive/internal/activities/mocks"
 	upgradetypes "github.com/leowmjw/go-temporal-pg/pgactive/internal/types"
 )
+
+func newLogger() *slog.Logger {
+	return slog.New(slog.NewJSONHandler(os.Stdout, nil))
+}
+
+// availableDBOutput returns a DescribeDBInstancesOutput for a single available postgres instance.
+func availableDBOutput(id, version string) *rds.DescribeDBInstancesOutput {
+	return &rds.DescribeDBInstancesOutput{
+		DBInstances: []types.DBInstance{
+			{
+				DBInstanceIdentifier: aws.String(id),
+				Engine:               aws.String("postgres"),
+				EngineVersion:        aws.String(version),
+				DBInstanceStatus:     aws.String("available"),
+			},
+		},
+	}
+}
 
 func TestValidateInput(t *testing.T) {
 	tests := []struct {
 		name        string
 		input       upgradetypes.UpgradeInput
-		setupMocks  func(*mocks.MockRDSClient)
+		rds         RDSClientFuncs
 		expectError bool
 		errorMsg    string
 	}{
@@ -34,19 +51,10 @@ func TestValidateInput(t *testing.T) {
 				ShiftPercentages:   []int{25, 25, 50},
 				Subnets:            []string{"subnet-1", "subnet-2"},
 			},
-			setupMocks: func(mockRDS *mocks.MockRDSClient) {
-				mockRDS.EXPECT().DescribeDBInstances(gomock.Any(), &rds.DescribeDBInstancesInput{
-					DBInstanceIdentifier: aws.String("source-db"),
-				}, gomock.Any()).Return(&rds.DescribeDBInstancesOutput{
-					DBInstances: []types.DBInstance{
-						{
-							DBInstanceIdentifier: aws.String("source-db"),
-							Engine:               aws.String("postgres"),
-							EngineVersion:        aws.String("14.9"),
-							DBInstanceStatus:     aws.String("available"),
-						},
-					},
-				}, nil)
+			rds: RDSClientFuncs{
+				DescribeDBInstances: func(_ context.Context, _ *rds.DescribeDBInstancesInput, _ ...func(*rds.Options)) (*rds.DescribeDBInstancesOutput, error) {
+					return availableDBOutput("source-db", "14.9"), nil
+				},
 			},
 			expectError: false,
 		},
@@ -57,9 +65,10 @@ func TestValidateInput(t *testing.T) {
 				TargetVersion:      "15.4",
 				ShiftPercentages:   []int{100},
 			},
-			setupMocks: func(mockRDS *mocks.MockRDSClient) {
-				mockRDS.EXPECT().DescribeDBInstances(gomock.Any(), gomock.Any(), gomock.Any()).Return(
-					&rds.DescribeDBInstancesOutput{}, errors.New("DB instance not found"))
+			rds: RDSClientFuncs{
+				DescribeDBInstances: func(_ context.Context, _ *rds.DescribeDBInstancesInput, _ ...func(*rds.Options)) (*rds.DescribeDBInstancesOutput, error) {
+					return &rds.DescribeDBInstancesOutput{}, errors.New("DB instance not found")
+				},
 			},
 			expectError: true,
 			errorMsg:    "failed to describe source DB instance",
@@ -71,17 +80,19 @@ func TestValidateInput(t *testing.T) {
 				TargetVersion:      "15.4",
 				ShiftPercentages:   []int{100},
 			},
-			setupMocks: func(mockRDS *mocks.MockRDSClient) {
-				mockRDS.EXPECT().DescribeDBInstances(gomock.Any(), gomock.Any(), gomock.Any()).Return(&rds.DescribeDBInstancesOutput{
-					DBInstances: []types.DBInstance{
-						{
-							DBInstanceIdentifier: aws.String("mysql-db"),
-							Engine:               aws.String("mysql"),
-							EngineVersion:        aws.String("8.0"),
-							DBInstanceStatus:     aws.String("available"),
+			rds: RDSClientFuncs{
+				DescribeDBInstances: func(_ context.Context, _ *rds.DescribeDBInstancesInput, _ ...func(*rds.Options)) (*rds.DescribeDBInstancesOutput, error) {
+					return &rds.DescribeDBInstancesOutput{
+						DBInstances: []types.DBInstance{
+							{
+								DBInstanceIdentifier: aws.String("mysql-db"),
+								Engine:               aws.String("mysql"),
+								EngineVersion:        aws.String("8.0"),
+								DBInstanceStatus:     aws.String("available"),
+							},
 						},
-					},
-				}, nil)
+					}, nil
+				},
 			},
 			expectError: true,
 			errorMsg:    "source DB must be PostgreSQL",
@@ -91,19 +102,12 @@ func TestValidateInput(t *testing.T) {
 			input: upgradetypes.UpgradeInput{
 				SourceDBInstanceID: "source-db",
 				TargetVersion:      "15.4",
-				ShiftPercentages:   []int{25, 25, 25}, // Sum is 75, not 100
+				ShiftPercentages:   []int{25, 25, 25}, // sum is 75, not 100
 			},
-			setupMocks: func(mockRDS *mocks.MockRDSClient) {
-				mockRDS.EXPECT().DescribeDBInstances(gomock.Any(), gomock.Any(), gomock.Any()).Return(&rds.DescribeDBInstancesOutput{
-					DBInstances: []types.DBInstance{
-						{
-							DBInstanceIdentifier: aws.String("source-db"),
-							Engine:               aws.String("postgres"),
-							EngineVersion:        aws.String("14.9"),
-							DBInstanceStatus:     aws.String("available"),
-						},
-					},
-				}, nil)
+			rds: RDSClientFuncs{
+				DescribeDBInstances: func(_ context.Context, _ *rds.DescribeDBInstancesInput, _ ...func(*rds.Options)) (*rds.DescribeDBInstancesOutput, error) {
+					return availableDBOutput("source-db", "14.9"), nil
+				},
 			},
 			expectError: true,
 			errorMsg:    "shift percentages must sum to 100",
@@ -112,20 +116,13 @@ func TestValidateInput(t *testing.T) {
 			name: "target version not newer",
 			input: upgradetypes.UpgradeInput{
 				SourceDBInstanceID: "source-db",
-				TargetVersion:      "14.8", // Older than current 14.9
+				TargetVersion:      "14.8", // older than 14.9
 				ShiftPercentages:   []int{100},
 			},
-			setupMocks: func(mockRDS *mocks.MockRDSClient) {
-				mockRDS.EXPECT().DescribeDBInstances(gomock.Any(), gomock.Any(), gomock.Any()).Return(&rds.DescribeDBInstancesOutput{
-					DBInstances: []types.DBInstance{
-						{
-							DBInstanceIdentifier: aws.String("source-db"),
-							Engine:               aws.String("postgres"),
-							EngineVersion:        aws.String("14.9"),
-							DBInstanceStatus:     aws.String("available"),
-						},
-					},
-				}, nil)
+			rds: RDSClientFuncs{
+				DescribeDBInstances: func(_ context.Context, _ *rds.DescribeDBInstancesInput, _ ...func(*rds.Options)) (*rds.DescribeDBInstancesOutput, error) {
+					return availableDBOutput("source-db", "14.9"), nil
+				},
 			},
 			expectError: true,
 			errorMsg:    "target version 14.8 must be newer than current version 14.9",
@@ -137,17 +134,19 @@ func TestValidateInput(t *testing.T) {
 				TargetVersion:      "15.4",
 				ShiftPercentages:   []int{100},
 			},
-			setupMocks: func(mockRDS *mocks.MockRDSClient) {
-				mockRDS.EXPECT().DescribeDBInstances(gomock.Any(), gomock.Any(), gomock.Any()).Return(&rds.DescribeDBInstancesOutput{
-					DBInstances: []types.DBInstance{
-						{
-							DBInstanceIdentifier: aws.String("source-db"),
-							Engine:               aws.String("postgres"),
-							EngineVersion:        aws.String("14.9"),
-							DBInstanceStatus:     aws.String("backing-up"),
+			rds: RDSClientFuncs{
+				DescribeDBInstances: func(_ context.Context, _ *rds.DescribeDBInstancesInput, _ ...func(*rds.Options)) (*rds.DescribeDBInstancesOutput, error) {
+					return &rds.DescribeDBInstancesOutput{
+						DBInstances: []types.DBInstance{
+							{
+								DBInstanceIdentifier: aws.String("source-db"),
+								Engine:               aws.String("postgres"),
+								EngineVersion:        aws.String("14.9"),
+								DBInstanceStatus:     aws.String("backing-up"),
+							},
 						},
-					},
-				}, nil)
+					}, nil
+				},
 			},
 			expectError: true,
 			errorMsg:    "source DB must be in 'available' status",
@@ -156,17 +155,8 @@ func TestValidateInput(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctrl := gomock.NewController(t)
-			defer ctrl.Finish()
-
-			mockRDS := mocks.NewMockRDSClient(ctrl)
-			logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-			activities := NewActivities(mockRDS, nil, logger)
-
-			tt.setupMocks(mockRDS)
-
-			err := activities.ValidateInput(context.Background(), tt.input)
-
+			a := NewActivities(tt.rds, nil, newLogger())
+			err := a.ValidateInput(context.Background(), tt.input)
 			if tt.expectError {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.errorMsg)
@@ -179,10 +169,10 @@ func TestValidateInput(t *testing.T) {
 
 func TestProvisionTargetDB(t *testing.T) {
 	tests := []struct {
-		name       string
-		input      upgradetypes.UpgradeInput
-		setupMocks func(*mocks.MockRDSClient)
-		expectErr  bool
+		name      string
+		input     upgradetypes.UpgradeInput
+		rds       RDSClientFuncs
+		expectErr bool
 	}{
 		{
 			name: "successful provisioning",
@@ -192,42 +182,44 @@ func TestProvisionTargetDB(t *testing.T) {
 				InstanceClass:      "db.r6g.large",
 				SecurityGroupIDs:   []string{"sg-123"},
 			},
-			setupMocks: func(mockRDS *mocks.MockRDSClient) {
-				// Mock DescribeDBInstances for source DB
-				mockRDS.EXPECT().DescribeDBInstances(gomock.Any(), &rds.DescribeDBInstancesInput{
-					DBInstanceIdentifier: aws.String("source-db"),
-				}, gomock.Any()).Return(&rds.DescribeDBInstancesOutput{
-					DBInstances: []types.DBInstance{
-						{
-							DBInstanceIdentifier: aws.String("source-db"),
-							DBInstanceClass:      aws.String("db.r6g.medium"),
-							Engine:               aws.String("postgres"),
-							EngineVersion:        aws.String("14.9"),
-							AllocatedStorage:     aws.Int32(100),
-							StorageType:          aws.String("gp2"),
-							StorageEncrypted:     aws.Bool(true),
-							MasterUsername:       aws.String("postgres"),
-							DBSubnetGroup: &types.DBSubnetGroup{
-								DBSubnetGroupName: aws.String("default-subnet-group"),
+			rds: func() RDSClientFuncs {
+				// First call: describe source DB; subsequent calls: waiter polling.
+				var callCount int32
+				return RDSClientFuncs{
+					DescribeDBInstances: func(_ context.Context, _ *rds.DescribeDBInstancesInput, _ ...func(*rds.Options)) (*rds.DescribeDBInstancesOutput, error) {
+						if atomic.AddInt32(&callCount, 1) == 1 {
+							return &rds.DescribeDBInstancesOutput{
+								DBInstances: []types.DBInstance{
+									{
+										DBInstanceIdentifier: aws.String("source-db"),
+										DBInstanceClass:      aws.String("db.r6g.medium"),
+										Engine:               aws.String("postgres"),
+										EngineVersion:        aws.String("14.9"),
+										AllocatedStorage:     aws.Int32(100),
+										StorageType:          aws.String("gp2"),
+										StorageEncrypted:     aws.Bool(true),
+										MasterUsername:       aws.String("postgres"),
+										DBSubnetGroup: &types.DBSubnetGroup{
+											DBSubnetGroupName: aws.String("default-subnet-group"),
+										},
+									},
+								},
+							}, nil
+						}
+						return &rds.DescribeDBInstancesOutput{
+							DBInstances: []types.DBInstance{
+								{
+									DBInstanceIdentifier: aws.String("source-db-upgrade-123"),
+									DBInstanceStatus:     aws.String("available"),
+								},
 							},
-						},
+						}, nil
 					},
-				}, nil)
-
-				// Mock CreateDBInstance
-				mockRDS.EXPECT().CreateDBInstance(gomock.Any(), gomock.Any(), gomock.Any()).Return(
-					&rds.CreateDBInstanceOutput{}, nil)
-
-				// Mock DescribeDBInstances for waiting (waiter simulation)
-				mockRDS.EXPECT().DescribeDBInstances(gomock.Any(), gomock.Any(), gomock.Any()).Return(&rds.DescribeDBInstancesOutput{
-					DBInstances: []types.DBInstance{
-						{
-							DBInstanceIdentifier: aws.String("source-db-upgrade-123"),
-							DBInstanceStatus:     aws.String("available"),
-						},
+					CreateDBInstance: func(_ context.Context, _ *rds.CreateDBInstanceInput, _ ...func(*rds.Options)) (*rds.CreateDBInstanceOutput, error) {
+						return &rds.CreateDBInstanceOutput{}, nil
 					},
-				}, nil).AnyTimes()
-			},
+				}
+			}(),
 			expectErr: false,
 		},
 		{
@@ -236,9 +228,10 @@ func TestProvisionTargetDB(t *testing.T) {
 				SourceDBInstanceID: "source-db",
 				TargetVersion:      "15.4",
 			},
-			setupMocks: func(mockRDS *mocks.MockRDSClient) {
-				mockRDS.EXPECT().DescribeDBInstances(gomock.Any(), gomock.Any(), gomock.Any()).Return(
-					nil, errors.New("describe failed"))
+			rds: RDSClientFuncs{
+				DescribeDBInstances: func(_ context.Context, _ *rds.DescribeDBInstancesInput, _ ...func(*rds.Options)) (*rds.DescribeDBInstancesOutput, error) {
+					return nil, errors.New("describe failed")
+				},
 			},
 			expectErr: true,
 		},
@@ -248,25 +241,27 @@ func TestProvisionTargetDB(t *testing.T) {
 				SourceDBInstanceID: "source-db",
 				TargetVersion:      "15.4",
 			},
-			setupMocks: func(mockRDS *mocks.MockRDSClient) {
-				mockRDS.EXPECT().DescribeDBInstances(gomock.Any(), gomock.Any(), gomock.Any()).Return(&rds.DescribeDBInstancesOutput{
-					DBInstances: []types.DBInstance{
-						{
-							DBInstanceIdentifier: aws.String("source-db"),
-							DBInstanceClass:      aws.String("db.r6g.medium"),
-							Engine:               aws.String("postgres"),
-							AllocatedStorage:     aws.Int32(100),
-							StorageType:          aws.String("gp2"),
-							MasterUsername:       aws.String("postgres"),
-							DBSubnetGroup: &types.DBSubnetGroup{
-								DBSubnetGroupName: aws.String("default-subnet-group"),
+			rds: RDSClientFuncs{
+				DescribeDBInstances: func(_ context.Context, _ *rds.DescribeDBInstancesInput, _ ...func(*rds.Options)) (*rds.DescribeDBInstancesOutput, error) {
+					return &rds.DescribeDBInstancesOutput{
+						DBInstances: []types.DBInstance{
+							{
+								DBInstanceIdentifier: aws.String("source-db"),
+								DBInstanceClass:      aws.String("db.r6g.medium"),
+								Engine:               aws.String("postgres"),
+								AllocatedStorage:     aws.Int32(100),
+								StorageType:          aws.String("gp2"),
+								MasterUsername:       aws.String("postgres"),
+								DBSubnetGroup: &types.DBSubnetGroup{
+									DBSubnetGroupName: aws.String("default-subnet-group"),
+								},
 							},
 						},
-					},
-				}, nil)
-
-				mockRDS.EXPECT().CreateDBInstance(gomock.Any(), gomock.Any(), gomock.Any()).Return(
-					nil, errors.New("create failed"))
+					}, nil
+				},
+				CreateDBInstance: func(_ context.Context, _ *rds.CreateDBInstanceInput, _ ...func(*rds.Options)) (*rds.CreateDBInstanceOutput, error) {
+					return nil, errors.New("create failed")
+				},
 			},
 			expectErr: true,
 		},
@@ -274,17 +269,8 @@ func TestProvisionTargetDB(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctrl := gomock.NewController(t)
-			defer ctrl.Finish()
-
-			mockRDS := mocks.NewMockRDSClient(ctrl)
-			logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-			activities := NewActivities(mockRDS, nil, logger)
-
-			tt.setupMocks(mockRDS)
-
-			result, err := activities.ProvisionTargetDB(context.Background(), tt.input)
-
+			a := NewActivities(tt.rds, nil, newLogger())
+			result, err := a.ProvisionTargetDB(context.Background(), tt.input)
 			if tt.expectErr {
 				require.Error(t, err)
 			} else {
@@ -298,10 +284,10 @@ func TestProvisionTargetDB(t *testing.T) {
 
 func TestConfigurePgactiveParams(t *testing.T) {
 	tests := []struct {
-		name       string
-		input      upgradetypes.ActivityInput
-		setupMocks func(*mocks.MockRDSClient)
-		expectErr  bool
+		name      string
+		input     upgradetypes.ActivityInput
+		rds       RDSClientFuncs
+		expectErr bool
 	}{
 		{
 			name: "successful configuration",
@@ -309,48 +295,42 @@ func TestConfigurePgactiveParams(t *testing.T) {
 				SourceDBInstanceID: "source-db",
 				TargetDBInstanceID: "target-db",
 			},
-			setupMocks: func(mockRDS *mocks.MockRDSClient) {
-				// Mock for source DB
-				mockRDS.EXPECT().DescribeDBInstances(gomock.Any(), &rds.DescribeDBInstancesInput{
-					DBInstanceIdentifier: aws.String("source-db"),
-				}, gomock.Any()).Return(&rds.DescribeDBInstancesOutput{
-					DBInstances: []types.DBInstance{
-						{
-							DBParameterGroups: []types.DBParameterGroupStatus{
-								{DBParameterGroupName: aws.String("source-param-group")},
+			rds: func() RDSClientFuncs {
+				paramGroup := func(name string) *rds.DescribeDBInstancesOutput {
+					return &rds.DescribeDBInstancesOutput{
+						DBInstances: []types.DBInstance{
+							{
+								DBParameterGroups: []types.DBParameterGroupStatus{
+									{DBParameterGroupName: aws.String(name)},
+								},
+								DBInstanceStatus: aws.String("available"),
 							},
 						},
-					},
-				}, nil)
-
-				// Mock for target DB
-				mockRDS.EXPECT().DescribeDBInstances(gomock.Any(), &rds.DescribeDBInstancesInput{
-					DBInstanceIdentifier: aws.String("target-db"),
-				}, gomock.Any()).Return(&rds.DescribeDBInstancesOutput{
-					DBInstances: []types.DBInstance{
-						{
-							DBParameterGroups: []types.DBParameterGroupStatus{
-								{DBParameterGroupName: aws.String("target-param-group")},
+					}
+				}
+				return RDSClientFuncs{
+					DescribeDBInstances: func(_ context.Context, p *rds.DescribeDBInstancesInput, _ ...func(*rds.Options)) (*rds.DescribeDBInstancesOutput, error) {
+						if p.DBInstanceIdentifier != nil && *p.DBInstanceIdentifier == "source-db" {
+							return paramGroup("source-param-group"), nil
+						}
+						if p.DBInstanceIdentifier != nil && *p.DBInstanceIdentifier == "target-db" {
+							return paramGroup("target-param-group"), nil
+						}
+						// waiter poll: return available, no param group needed
+						return &rds.DescribeDBInstancesOutput{
+							DBInstances: []types.DBInstance{
+								{DBInstanceStatus: aws.String("available")},
 							},
-						},
+						}, nil
 					},
-				}, nil)
-
-				// Mock parameter group modifications
-				mockRDS.EXPECT().ModifyDBParameterGroup(gomock.Any(), gomock.Any(), gomock.Any()).Return(
-					&rds.ModifyDBParameterGroupOutput{}, nil).Times(2)
-
-				// Mock reboots
-				mockRDS.EXPECT().RebootDBInstance(gomock.Any(), gomock.Any(), gomock.Any()).Return(
-					&rds.RebootDBInstanceOutput{}, nil).Times(2)
-
-				// Mock waits for availability after reboot
-				mockRDS.EXPECT().DescribeDBInstances(gomock.Any(), gomock.Any(), gomock.Any()).Return(&rds.DescribeDBInstancesOutput{
-					DBInstances: []types.DBInstance{
-						{DBInstanceStatus: aws.String("available")},
+					ModifyDBParameterGroup: func(_ context.Context, _ *rds.ModifyDBParameterGroupInput, _ ...func(*rds.Options)) (*rds.ModifyDBParameterGroupOutput, error) {
+						return &rds.ModifyDBParameterGroupOutput{}, nil
 					},
-				}, nil).AnyTimes()
-			},
+					RebootDBInstance: func(_ context.Context, _ *rds.RebootDBInstanceInput, _ ...func(*rds.Options)) (*rds.RebootDBInstanceOutput, error) {
+						return &rds.RebootDBInstanceOutput{}, nil
+					},
+				}
+			}(),
 			expectErr: false,
 		},
 		{
@@ -359,9 +339,10 @@ func TestConfigurePgactiveParams(t *testing.T) {
 				SourceDBInstanceID: "source-db",
 				TargetDBInstanceID: "target-db",
 			},
-			setupMocks: func(mockRDS *mocks.MockRDSClient) {
-				mockRDS.EXPECT().DescribeDBInstances(gomock.Any(), gomock.Any(), gomock.Any()).Return(
-					nil, errors.New("describe failed"))
+			rds: RDSClientFuncs{
+				DescribeDBInstances: func(_ context.Context, _ *rds.DescribeDBInstancesInput, _ ...func(*rds.Options)) (*rds.DescribeDBInstancesOutput, error) {
+					return nil, errors.New("describe failed")
+				},
 			},
 			expectErr: true,
 		},
@@ -369,17 +350,8 @@ func TestConfigurePgactiveParams(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctrl := gomock.NewController(t)
-			defer ctrl.Finish()
-
-			mockRDS := mocks.NewMockRDSClient(ctrl)
-			logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-			activities := NewActivities(mockRDS, nil, logger)
-
-			tt.setupMocks(mockRDS)
-
-			err := activities.ConfigurePgactiveParams(context.Background(), tt.input)
-
+			a := NewActivities(tt.rds, nil, newLogger())
+			err := a.ConfigurePgactiveParams(context.Background(), tt.input)
 			if tt.expectErr {
 				require.Error(t, err)
 			} else {
@@ -390,11 +362,7 @@ func TestConfigurePgactiveParams(t *testing.T) {
 }
 
 func TestTrafficShiftPhase(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	activities := NewActivities(nil, nil, logger)
+	a := NewActivities(RDSClientFuncs{}, nil, newLogger())
 
 	tests := []struct {
 		name  string
@@ -426,7 +394,7 @@ func TestTrafficShiftPhase(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := activities.TrafficShiftPhase(context.Background(), tt.input)
+			err := a.TrafficShiftPhase(context.Background(), tt.input)
 			require.NoError(t, err)
 		})
 	}
@@ -434,19 +402,20 @@ func TestTrafficShiftPhase(t *testing.T) {
 
 func TestDecommissionSource(t *testing.T) {
 	tests := []struct {
-		name       string
-		input      upgradetypes.ActivityInput
-		setupMocks func(*mocks.MockRDSClient)
-		expectErr  bool
+		name      string
+		input     upgradetypes.ActivityInput
+		rds       RDSClientFuncs
+		expectErr bool
 	}{
 		{
 			name: "successful decommission",
 			input: upgradetypes.ActivityInput{
 				SourceDBInstanceID: "source-db",
 			},
-			setupMocks: func(mockRDS *mocks.MockRDSClient) {
-				mockRDS.EXPECT().DeleteDBInstance(gomock.Any(), gomock.Any(), gomock.Any()).Return(
-					&rds.DeleteDBInstanceOutput{}, nil)
+			rds: RDSClientFuncs{
+				DeleteDBInstance: func(_ context.Context, _ *rds.DeleteDBInstanceInput, _ ...func(*rds.Options)) (*rds.DeleteDBInstanceOutput, error) {
+					return &rds.DeleteDBInstanceOutput{}, nil
+				},
 			},
 			expectErr: false,
 		},
@@ -455,9 +424,10 @@ func TestDecommissionSource(t *testing.T) {
 			input: upgradetypes.ActivityInput{
 				SourceDBInstanceID: "source-db",
 			},
-			setupMocks: func(mockRDS *mocks.MockRDSClient) {
-				mockRDS.EXPECT().DeleteDBInstance(gomock.Any(), gomock.Any(), gomock.Any()).Return(
-					nil, errors.New("delete failed"))
+			rds: RDSClientFuncs{
+				DeleteDBInstance: func(_ context.Context, _ *rds.DeleteDBInstanceInput, _ ...func(*rds.Options)) (*rds.DeleteDBInstanceOutput, error) {
+					return nil, errors.New("delete failed")
+				},
 			},
 			expectErr: true,
 		},
@@ -465,17 +435,8 @@ func TestDecommissionSource(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctrl := gomock.NewController(t)
-			defer ctrl.Finish()
-
-			mockRDS := mocks.NewMockRDSClient(ctrl)
-			logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-			activities := NewActivities(mockRDS, nil, logger)
-
-			tt.setupMocks(mockRDS)
-
-			err := activities.DecommissionSource(context.Background(), tt.input)
-
+			a := NewActivities(tt.rds, nil, newLogger())
+			err := a.DecommissionSource(context.Background(), tt.input)
 			if tt.expectErr {
 				require.Error(t, err)
 			} else {
@@ -488,86 +449,49 @@ func TestDecommissionSource(t *testing.T) {
 // Edge case tests for error scenarios
 func TestValidateInput_EdgeCases(t *testing.T) {
 	t.Run("empty shift percentages", func(t *testing.T) {
-		ctrl := gomock.NewController(t)
-		defer ctrl.Finish()
+		a := NewActivities(RDSClientFuncs{
+			DescribeDBInstances: func(_ context.Context, _ *rds.DescribeDBInstancesInput, _ ...func(*rds.Options)) (*rds.DescribeDBInstancesOutput, error) {
+				return availableDBOutput("source-db", "14.9"), nil
+			},
+		}, nil, newLogger())
 
-		mockRDS := mocks.NewMockRDSClient(ctrl)
-		logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-		activities := NewActivities(mockRDS, nil, logger)
-
-		input := upgradetypes.UpgradeInput{
+		err := a.ValidateInput(context.Background(), upgradetypes.UpgradeInput{
 			SourceDBInstanceID: "source-db",
 			TargetVersion:      "15.4",
-			ShiftPercentages:   []int{}, // Empty array
-		}
-
-		// Mock DescribeDBInstances call that happens before shift percentage validation
-		mockRDS.EXPECT().DescribeDBInstances(gomock.Any(), gomock.Any(), gomock.Any()).Return(&rds.DescribeDBInstancesOutput{
-			DBInstances: []types.DBInstance{
-				{
-					DBInstanceIdentifier: aws.String("source-db"),
-					Engine:               aws.String("postgres"),
-					EngineVersion:        aws.String("14.9"),
-					DBInstanceStatus:     aws.String("available"),
-				},
-			},
-		}, nil)
-
-		err := activities.ValidateInput(context.Background(), input)
+			ShiftPercentages:   []int{},
+		})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "at least one shift percentage must be specified")
 	})
 
 	t.Run("negative shift percentage", func(t *testing.T) {
-		ctrl := gomock.NewController(t)
-		defer ctrl.Finish()
+		a := NewActivities(RDSClientFuncs{
+			DescribeDBInstances: func(_ context.Context, _ *rds.DescribeDBInstancesInput, _ ...func(*rds.Options)) (*rds.DescribeDBInstancesOutput, error) {
+				return availableDBOutput("source-db", "14.9"), nil
+			},
+		}, nil, newLogger())
 
-		mockRDS := mocks.NewMockRDSClient(ctrl)
-		logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-		activities := NewActivities(mockRDS, nil, logger)
-
-		input := upgradetypes.UpgradeInput{
+		err := a.ValidateInput(context.Background(), upgradetypes.UpgradeInput{
 			SourceDBInstanceID: "source-db",
 			TargetVersion:      "15.4",
-			ShiftPercentages:   []int{-10, 110}, // Invalid values
-		}
-
-		// Mock DescribeDBInstances call that happens before shift percentage validation
-		mockRDS.EXPECT().DescribeDBInstances(gomock.Any(), gomock.Any(), gomock.Any()).Return(&rds.DescribeDBInstancesOutput{
-			DBInstances: []types.DBInstance{
-				{
-					DBInstanceIdentifier: aws.String("source-db"),
-					Engine:               aws.String("postgres"),
-					EngineVersion:        aws.String("14.9"),
-					DBInstanceStatus:     aws.String("available"),
-				},
-			},
-		}, nil)
-
-		err := activities.ValidateInput(context.Background(), input)
+			ShiftPercentages:   []int{-10, 110},
+		})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "shift percentage must be between 0 and 100")
 	})
 
 	t.Run("DB instance not found", func(t *testing.T) {
-		ctrl := gomock.NewController(t)
-		defer ctrl.Finish()
+		a := NewActivities(RDSClientFuncs{
+			DescribeDBInstances: func(_ context.Context, _ *rds.DescribeDBInstancesInput, _ ...func(*rds.Options)) (*rds.DescribeDBInstancesOutput, error) {
+				return &rds.DescribeDBInstancesOutput{DBInstances: []types.DBInstance{}}, nil
+			},
+		}, nil, newLogger())
 
-		mockRDS := mocks.NewMockRDSClient(ctrl)
-		logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-		activities := NewActivities(mockRDS, nil, logger)
-
-		input := upgradetypes.UpgradeInput{
+		err := a.ValidateInput(context.Background(), upgradetypes.UpgradeInput{
 			SourceDBInstanceID: "source-db",
 			TargetVersion:      "15.4",
 			ShiftPercentages:   []int{100},
-		}
-
-		mockRDS.EXPECT().DescribeDBInstances(gomock.Any(), gomock.Any()).Return(&rds.DescribeDBInstancesOutput{
-			DBInstances: []types.DBInstance{}, // Empty result
-		}, nil)
-
-		err := activities.ValidateInput(context.Background(), input)
+		})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "source DB instance source-db not found")
 	})
