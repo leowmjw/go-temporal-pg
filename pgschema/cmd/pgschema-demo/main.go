@@ -29,6 +29,7 @@ import (
 
 	"go.temporal.io/sdk/client"
 
+	"github.com/leowmjw/go-temporal-pg/pgschema/internal/activities"
 	"github.com/leowmjw/go-temporal-pg/pgschema/internal/types"
 	"github.com/leowmjw/go-temporal-pg/pgschema/internal/workflow"
 )
@@ -151,7 +152,7 @@ func main() {
 	mux.HandleFunc("POST /signal/app-ready", srv.handleSignal(workflow.SignalAppReady, "app-ready"))
 	mux.HandleFunc("POST /signal/rollback", srv.handleSignal(workflow.SignalRollback, "rollback"))
 
-	log.Info("pgschema demo web UI listening", slog.String("addr", *addr), slog.String("dsn", redactForLog(*dsn)))
+	log.Info("pgschema demo web UI listening", slog.String("addr", *addr), slog.String("dsn", activities.RedactDSN(*dsn)))
 	if err := http.ListenAndServe(*addr, mux); err != nil {
 		log.Error("server exited", slog.String("error", err.Error()))
 		os.Exit(1)
@@ -165,15 +166,6 @@ func envOr(key, def string) string {
 	return def
 }
 
-// redactForLog avoids printing a raw password at startup; reuses no package
-// code on purpose (this binary intentionally has zero import coupling to
-// internal/activities, which owns the real redactDSN).
-func redactForLog(dsn string) string {
-	if i := strings.Index(dsn, "@"); i >= 0 {
-		return "***@" + dsn[i+1:]
-	}
-	return dsn
-}
 
 // ─── Page ───────────────────────────────────────────────────────────────────
 

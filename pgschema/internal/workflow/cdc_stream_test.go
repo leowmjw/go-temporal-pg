@@ -41,7 +41,7 @@ import (
 //    workflow environment's IsContinueAsNew flag.
 //
 //  LagQuery_ReturnsLatestValue — the "lag" query must always reflect the most
-//    recent PollLag activity result.  Zero-lag means the replica is caught up
+//    recent GetStreamHealth activity result.  Zero-lag means the replica is caught up
 //    and safe for a preview clone to read.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -81,7 +81,6 @@ func newFakeStream(opts ...func(*fakeStream)) *fakeStream {
 				return nil
 			},
 			StopFn:   func(_ context.Context, _ types.StreamConfig) error { return nil },
-			GetLagFn: func(_ context.Context, _ types.StreamConfig) (int64, error) { return 0, nil },
 			GetHealthFn: func(_ context.Context, cfg types.StreamConfig) (*types.StreamHealthResponse, error) {
 				return &types.StreamHealthResponse{
 					Mode:                  cfg.Mode,
@@ -107,11 +106,6 @@ func newFakeStream(opts ...func(*fakeStream)) *fakeStream {
 				}, nil
 			},
 			ValidateRulesFn: func(_ context.Context, _ types.StreamConfig, _ []types.AnonymizationRule) error { return nil },
-			// PollLagFn: return immediately on ctx cancellation for test speed.
-			PollLagFn: func(ctx context.Context, _ types.StreamConfig, _ time.Duration) (int64, error) {
-				<-ctx.Done()
-				return 0, nil
-			},
 		},
 		alert: &activities.AlertActivities{
 			PageFn: func(_ context.Context, _ types.AlertMessage) error { return nil },
@@ -183,14 +177,6 @@ func (s *CDCStreamTestSuite) TestStreamDies_AlertFired() {
 	fake := newFakeStream(func(f *fakeStream) {
 		f.pgstream.RunFn = func(_ context.Context, _ types.StreamConfig) error {
 			return errors.New("pgstream: connection to source lost")
-		}
-		// RunStream retries (bounded, see cdc_stream.go) before finally
-		// failing. The default PollLagFn blocks on ctx.Done() forever, which
-		// this scenario doesn't need and which interferes with the test
-		// clock's ability to skip through the retry backoffs — so give this
-		// test a lag poller that just returns immediately instead.
-		f.pgstream.PollLagFn = func(ctx context.Context, _ types.StreamConfig, _ time.Duration) (int64, error) {
-			return 0, nil
 		}
 		f.alert.PageFn = func(_ context.Context, _ types.AlertMessage) error {
 			alertFired = true
@@ -352,7 +338,7 @@ func (s *CDCStreamTestSuite) TestLagQuery_ReturnsLatestValue() {
 		s.NoError(err)
 		var lag types.LagResponse
 		s.NoError(val.Get(&lag))
-		// Lag is populated by the PollLag goroutine.  Value may be 0 (initial)
+		// Lag is populated by the GetStreamHealth goroutine.  Value may be 0 (initial)
 		// or 4096 depending on goroutine scheduling in the test environment.
 		s.GreaterOrEqual(lag.LagBytes, int64(0))
 

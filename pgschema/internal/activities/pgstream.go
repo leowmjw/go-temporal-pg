@@ -49,13 +49,9 @@ type PgstreamActivities struct {
 	InitFn          func(ctx context.Context, cfg types.StreamConfig) error
 	RunFn           func(ctx context.Context, cfg types.StreamConfig) error
 	StopFn          func(ctx context.Context, cfg types.StreamConfig) error
-	GetLagFn        func(ctx context.Context, cfg types.StreamConfig) (int64, error)
 	GetHealthFn     func(ctx context.Context, cfg types.StreamConfig) (*types.StreamHealthResponse, error)
 	PreflightFn     func(ctx context.Context, cfg types.StreamConfig) (*types.PreflightStatus, error)
 	ValidateRulesFn func(ctx context.Context, cfg types.StreamConfig, rules []types.AnonymizationRule) error
-	// PollLagFn optionally overrides the entire PollLag loop for testing.
-	// When nil, the default ticker-based implementation is used.
-	PollLagFn func(ctx context.Context, cfg types.StreamConfig, interval time.Duration) (int64, error)
 }
 
 // NewPgstreamActivities returns a PgstreamActivities wired to the real
@@ -65,7 +61,6 @@ func NewPgstreamActivities(log *slog.Logger) *PgstreamActivities {
 	a.InitFn = a.defaultInit
 	a.RunFn = a.defaultRun
 	a.StopFn = a.defaultStop
-	a.GetLagFn = a.defaultGetLag
 	a.GetHealthFn = a.defaultGetHealth
 	a.PreflightFn = a.defaultPreflight
 	a.ValidateRulesFn = a.defaultValidateRules
@@ -131,59 +126,6 @@ func (a *PgstreamActivities) RunStream(ctx context.Context, cfg types.StreamConf
 	}
 }
 
-// PollLag polls replication lag on a fixed interval until ctx is cancelled.
-// Returns the last observed lag in bytes. Emits heartbeats so Temporal knows
-// the activity is alive.
-func (a *PgstreamActivities) PollLag(ctx context.Context, cfg types.StreamConfig, interval time.Duration) (int64, error) {
-	cfg = normalizeStreamConfig(cfg)
-	if a.PollLagFn != nil {
-		return a.PollLagFn(ctx, cfg, interval)
-	}
-	if interval <= 0 {
-		interval = 5 * time.Second
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	var lastLag int64
-	consecutiveFailures := 0
-	for {
-		select {
-		case <-ctx.Done():
-			a.logger().InfoContext(ctx, "lag polling stopped",
-				slog.String("flow", "end"),
-				slog.String("op", "pgstream.poll_lag"),
-				slog.String("stream_id", cfg.StreamID),
-				slog.Int64("last_lag_bytes", lastLag))
-			return lastLag, nil
-		case <-ticker.C:
-			lag, err := a.GetLagFn(ctx, cfg)
-			if err != nil {
-				consecutiveFailures++
-				a.logger().WarnContext(ctx, "failed to get lag",
-					slog.String("op", "pgstream.poll_lag"),
-					slog.String("stream_id", cfg.StreamID),
-					slog.Int("consecutive_failures", consecutiveFailures),
-					slog.String("error", err.Error()))
-				if max := cfg.Guardrails.MaxConsecutivePollFailures; max > 0 && consecutiveFailures >= max {
-					return lastLag, fmt.Errorf("lag polling failed %d consecutive times: %w", consecutiveFailures, err)
-				}
-				safeHeartbeat(ctx, "lag_poll_error")
-				continue
-			}
-			consecutiveFailures = 0
-			lastLag = lag
-			if max := cfg.Guardrails.MaxLagBytes; max > 0 && lag > max && cfg.Guardrails.OnViolation == types.GuardrailActionStop {
-				return lastLag, fmt.Errorf("lag guardrail exceeded: lag_bytes=%d max_lag_bytes=%d", lag, max)
-			}
-			a.logger().InfoContext(ctx, "replication lag",
-				slog.String("op", "pgstream.poll_lag"),
-				slog.String("stream_id", cfg.StreamID),
-				slog.Int64("lag_bytes", lag))
-			safeHeartbeat(ctx, fmt.Sprintf("lag_bytes=%d", lastLag))
-		}
-	}
-}
 
 // StopStream gracefully signals pgstream to stop.
 func (a *PgstreamActivities) StopStream(ctx context.Context, cfg types.StreamConfig) error {
@@ -195,18 +137,6 @@ func (a *PgstreamActivities) StopStream(ctx context.Context, cfg types.StreamCon
 		return &types.StreamError{StreamID: cfg.StreamID, Wrapped: err}
 	}
 	return nil
-}
-
-// GetLag returns the current replication lag once.
-func (a *PgstreamActivities) GetLag(ctx context.Context, cfg types.StreamConfig) (int64, error) {
-	cfg = normalizeStreamConfig(cfg)
-	end := a.startTrace(ctx, "pgstream.get_lag", slog.String("stream_id", cfg.StreamID))
-	lag, err := a.GetLagFn(ctx, cfg)
-	end(err)
-	if err != nil {
-		return 0, &types.StreamError{StreamID: cfg.StreamID, Wrapped: err}
-	}
-	return lag, nil
 }
 
 // GetStreamHealth returns rich stream health information for workflow queries.
@@ -317,13 +247,6 @@ func (a *PgstreamActivities) defaultStop(_ context.Context, _ types.StreamConfig
 	return nil
 }
 
-func (a *PgstreamActivities) defaultGetLag(ctx context.Context, cfg types.StreamConfig) (int64, error) {
-	health, err := a.defaultGetHealth(ctx, cfg)
-	if err != nil {
-		return 0, err
-	}
-	return health.LagBytes, nil
-}
 
 func (a *PgstreamActivities) defaultGetHealth(ctx context.Context, cfg types.StreamConfig) (*types.StreamHealthResponse, error) {
 	state, err := inspectPostgresState(ctx, cfg)
@@ -433,7 +356,7 @@ func (a *PgstreamActivities) defaultValidateRules(ctx context.Context, cfg types
 }
 
 // parseLagBytes extracts the replication lag (in bytes) from `pgstream status
-// --json` output. Split out from defaultGetLag so it can be unit tested.
+// --json` output. Split out for independent unit testing.
 func parseLagBytes(out []byte) (int64, error) {
 	status, err := parseStatusJSON(out)
 	if err != nil {

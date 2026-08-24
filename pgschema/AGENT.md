@@ -218,9 +218,9 @@ SSE wire-format exactness is pinned by `TestSSEWireFormat`
 
 ## Cleanup / refactor backlog
 
-Identified in session 2026-08-24. Listed by priority.
+**Status: all items completed 2026-08-24.**
 
-### 1. Remove `PollLag` activity — dead code, duplicates workflow guardrail logic (HIGH)
+### 1. ~~Remove `PollLag` activity~~ — DONE
 
 `CDCStreamWorkflow` (`internal/workflow/cdc_stream.go`) has an inline goroutine
 that calls `GetStreamHealth` on a timer and enforces guardrails (MaxLagBytes,
@@ -236,7 +236,7 @@ but never called via `workflow.ExecuteActivity`. Safe to delete:
   (`TestPollLag_TicksAndStops`, `TestPollLag_ErrorsTolerated`,
   `TestPollLag_Heartbeats`) — all test an activity the workflow never calls
 
-### 2. Remove `GetLag` activity — thin wrapper, dead code (HIGH)
+### 2. ~~Remove `GetLag` activity~~ — DONE
 
 `GetLag` delegates entirely to `defaultGetLag → defaultGetHealth`, returning only
 `health.LagBytes`. It is never dispatched by the workflow; it exists only to
@@ -251,20 +251,20 @@ support `PollLag`. Remove:
 Keep `defaultGetHealth` — it is used by `GetStreamHealth`, which the workflow
 does call.
 
-### 3. Fix stale comments in `cdc_stream_test.go` (LOW)
+### 3. ~~Fix stale comments in `cdc_stream_test.go`~~ — DONE
 
 Lines 44 and 355 say "Lag is populated by the PollLag goroutine" / "recent
 PollLag activity result". The workflow goroutine actually calls `GetStreamHealth`
 (not `PollLag`). Update comments to match the real mechanism.
 
-### 4. Export / deduplicate `redactDSN` (LOW)
+### 4. ~~Export / deduplicate `redactDSN`~~ — DONE
 
 `cmd/pgschema-demo/main.go` contains `redactForLog`, a local copy of
 `internal/activities.redactDSN`. The comment in `main.go` acknowledges the
 duplication. Simplest fix: export `RedactDSN` from the `activities` package (or
 move to `internal/dsn`) and use it from `cmd/pgschema-demo/main.go`.
 
-### 5. `QueryStreamLag` convenience query (DEFER)
+### 5. `QueryStreamLag` convenience query (DEFERRED — intentional)
 
 `"lag"` query returns a subset of `"health"`. Not wrong; keep unless the API
 surface is being deliberately narrowed. No action required.

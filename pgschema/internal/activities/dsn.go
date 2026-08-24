@@ -16,8 +16,13 @@ func isURIForm(dsn string) bool {
 	return strings.Contains(dsn, "://")
 }
 
-// redactDSN masks the password field for safe logging. Supports keyword=value
-// and URI forms.
+// RedactDSN masks the password field of a Postgres DSN for safe logging.
+// Supports both keyword=value and URI forms. Exported so callers outside this
+// package (e.g. cmd/pgschema-demo) can use the canonical implementation
+// instead of maintaining a local copy.
+func RedactDSN(dsn string) string { return redactDSN(dsn) }
+
+// redactDSN is the package-internal implementation used by activities helpers.
 func redactDSN(dsn string) string {
 	if masked, ok := redactKeywordPassword(dsn); ok {
 		return masked
