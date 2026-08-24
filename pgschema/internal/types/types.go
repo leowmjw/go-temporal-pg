@@ -8,18 +8,110 @@ import "time"
 
 // MigrationInput carries parameters for a pgroll zero-downtime migration.
 type MigrationInput struct {
-	DSN           string            `json:"dsn"`
-	MigrationJSON string            `json:"migration_json"` // pgroll migration file contents
-	Schema        string            `json:"schema"`
-	Tags          map[string]string `json:"tags,omitempty"`
+	DSN                       string            `json:"dsn"`
+	MigrationJSON             string            `json:"migration_json"` // pgroll migration file contents
+	Schema                    string            `json:"schema"`
+	Tags                      map[string]string `json:"tags,omitempty"`
+	AllowInitialize           bool              `json:"allow_initialize,omitempty"`
+	ExpectedPgrollVersion     string            `json:"expected_pgroll_version,omitempty"`
+	RequireExactPgrollVersion bool              `json:"require_exact_pgroll_version,omitempty"`
+	Policy                    MigrationPolicy   `json:"policy,omitempty"`
+}
+
+// MigrationPolicy controls migration preflight and risk gating behavior.
+type MigrationPolicy struct {
+	BlockRawSQL            bool     `json:"block_raw_sql,omitempty"`
+	BlockRenames           bool     `json:"block_renames,omitempty"`
+	BlockConstraints       bool     `json:"block_constraints,omitempty"`
+	BlockDefaults          bool     `json:"block_defaults,omitempty"`
+	BlockDestructive       bool     `json:"block_destructive,omitempty"`
+	RequireApprovalForRisk string   `json:"require_approval_for_risk,omitempty"`
+	Approved               bool     `json:"approved,omitempty"`
+	ProtectedSchemas       []string `json:"protected_schemas,omitempty"`
+	ProtectedTables        []string `json:"protected_tables,omitempty"`
 }
 
 // MigrationStatus reflects the current state of a pgroll migration.
 type MigrationStatus struct {
-	Name      string    `json:"name"`
-	Status    string    `json:"status"` // "In Progress" | "Complete" | "Rolled Back"
+	Name      string    `json:"name,omitempty"`
+	Version   string    `json:"version,omitempty"`
+	Status    string    `json:"status"` // "No migrations" | "In progress" | "Complete"
 	Schema    string    `json:"schema"`
-	StartedAt time.Time `json:"started_at"`
+	StartedAt time.Time `json:"started_at,omitempty"`
+}
+
+// EffectiveVersion returns the populated version field regardless of which JSON
+// shape pgroll emitted.
+func (s MigrationStatus) EffectiveVersion() string {
+	if s.Version != "" {
+		return s.Version
+	}
+	return s.Name
+}
+
+// PgrollReadiness describes whether pgroll metadata is ready for use.
+type PgrollReadiness struct {
+	Initialized     bool   `json:"initialized"`
+	AutoInitialized bool   `json:"auto_initialized,omitempty"`
+	Message         string `json:"message,omitempty"`
+}
+
+// MigrationRiskFinding captures one risky migration operation.
+type MigrationRiskFinding struct {
+	Operation string `json:"operation"`
+	Category  string `json:"category"`
+	Risk      string `json:"risk"`
+	Target    string `json:"target,omitempty"`
+	Reason    string `json:"reason"`
+}
+
+// MigrationRiskReport summarizes the migration risk profile.
+type MigrationRiskReport struct {
+	MigrationName    string                 `json:"migration_name,omitempty"`
+	OverallRisk      string                 `json:"overall_risk"`
+	Summary          string                 `json:"summary,omitempty"`
+	Findings         []MigrationRiskFinding `json:"findings,omitempty"`
+	RequiresApproval bool                   `json:"requires_approval,omitempty"`
+	Blocked          bool                   `json:"blocked,omitempty"`
+}
+
+// ReconcileInput asks the activity layer to compare workflow intent with
+// current pgroll state before a mutating step.
+type ReconcileInput struct {
+	Migration MigrationInput `json:"migration"`
+	Phase     string         `json:"phase"`
+}
+
+// ReconciliationResult describes the action that should follow a state check.
+type ReconciliationResult struct {
+	Action string           `json:"action"`
+	Reason string           `json:"reason,omitempty"`
+	Status *MigrationStatus `json:"status,omitempty"`
+}
+
+// BaselineInput carries parameters for a pgroll brownfield baseline run.
+type BaselineInput struct {
+	DSN                       string            `json:"dsn"`
+	Schema                    string            `json:"schema"`
+	Version                   string            `json:"version"`
+	Directory                 string            `json:"directory"`
+	Format                    string            `json:"format,omitempty"`
+	Operator                  string            `json:"operator,omitempty"`
+	Tags                      map[string]string `json:"tags,omitempty"`
+	AllowInitialize           bool              `json:"allow_initialize,omitempty"`
+	ExpectedPgrollVersion     string            `json:"expected_pgroll_version,omitempty"`
+	RequireExactPgrollVersion bool              `json:"require_exact_pgroll_version,omitempty"`
+}
+
+// BaselineResult captures the outcome of a baseline run.
+type BaselineResult struct {
+	Version       string    `json:"version"`
+	Directory     string    `json:"directory"`
+	Schema        string    `json:"schema"`
+	Operator      string    `json:"operator,omitempty"`
+	Status        string    `json:"status"`
+	PgrollVersion string    `json:"pgroll_version,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 // ─── CDC / Streaming (pgstream) ──────────────────────────────────────────────
@@ -253,11 +345,16 @@ type AlertMessage struct {
 
 // ProgressResponse is returned by workflow progress queries.
 type ProgressResponse struct {
-	Phase       string    `json:"phase"`
-	Status      string    `json:"status"` // "running" | "completed" | "failed" | "rolled_back"
-	Percent     int       `json:"percent"`
-	Message     string    `json:"message,omitempty"`
-	LastUpdated time.Time `json:"last_updated"`
+	Phase                string               `json:"phase"`
+	Status               string               `json:"status"` // "running" | "completed" | "failed" | "rolled_back"
+	Percent              int                  `json:"percent"`
+	Message              string               `json:"message,omitempty"`
+	LastUpdated          time.Time            `json:"last_updated"`
+	PgrollVersion        string               `json:"pgroll_version,omitempty"`
+	LatestSchema         string               `json:"latest_schema,omitempty"`
+	PgrollStatus         *MigrationStatus     `json:"pgroll_status,omitempty"`
+	RiskReport           *MigrationRiskReport `json:"risk_report,omitempty"`
+	ReconciliationAction string               `json:"reconciliation_action,omitempty"`
 }
 
 // LagResponse is returned by the CDC lag query.

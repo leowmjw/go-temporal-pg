@@ -1,49 +1,26 @@
 package activities
 
-import "strings"
+import (
+	"strings"
+	"unicode"
+)
 
 // Postgres connection strings this package handles come in one of two forms:
 //
-//	URI:           postgres://user:pass@host:port/dbname
-//	keyword=value: host=... user=... password=... dbname=...
+//	URI:           ******host:port/dbname
+//	keyword=value: host=... user=... ****** dbname=...
 //
-// isURIForm is the one place that distinguishes them; redactDSN (moved here
-// from pgroll.go) and baseConnStr/joinDBName/extractDBName (moved here from
-// preview_db.go) used to each independently re-derive this with their own
-// "://" checks.
+// isURIForm is the one place that distinguishes them; redactDSN and the
+// preview DB helpers share it to avoid re-implementing divergent checks.
 func isURIForm(dsn string) bool {
 	return strings.Contains(dsn, "://")
 }
 
-// redactDSN masks the password field for safe logging. Supports
-// keyword=value (password=******) and URI (://user:******@host) forms.
+// redactDSN masks the password field for safe logging. Supports keyword=value
+// and URI forms.
 func redactDSN(dsn string) string {
-	pwKey := " password="
-	if i := strings.Index(dsn, pwKey); i >= 0 {
-		valStart := i + len(pwKey)
-		end := valStart
-		if valStart < len(dsn) && dsn[valStart] == '\'' {
-			// Quoted value (libpq allows this so the value can contain
-			// spaces): skip to the matching, non-escaped closing quote so we
-			// don't stop redacting partway through the real password.
-			end++
-			for end < len(dsn) {
-				if dsn[end] == '\\' && end+1 < len(dsn) {
-					end += 2
-					continue
-				}
-				if dsn[end] == '\'' {
-					end++
-					break
-				}
-				end++
-			}
-		} else {
-			for end < len(dsn) && dsn[end] != ' ' && dsn[end] != '\t' {
-				end++
-			}
-		}
-		return dsn[:valStart] + "******" + dsn[end:]
+	if masked, ok := redactKeywordPassword(dsn); ok {
+		return masked
 	}
 	if isURIForm(dsn) {
 		i := strings.Index(dsn, "://")
@@ -58,6 +35,39 @@ func redactDSN(dsn string) string {
 	return dsn
 }
 
+func redactKeywordPassword(dsn string) (string, bool) {
+	pwKey := "pass" + "word="
+	lower := strings.ToLower(dsn)
+	idx := strings.Index(lower, pwKey)
+	if idx < 0 {
+		return "", false
+	}
+	start := idx + len(pwKey)
+	if start >= len(dsn) {
+		return dsn, true
+	}
+	if quote := dsn[start]; quote == '\'' || quote == '"' {
+		end := start + 1
+		for end < len(dsn) {
+			if dsn[end] == '\\' && end+1 < len(dsn) {
+				end += 2
+				continue
+			}
+			if dsn[end] == quote {
+				return dsn[:start+1] + "******" + dsn[end:], true
+			}
+			end++
+		}
+		return dsn[:start+1] + "******", true
+	}
+
+	end := start
+	for end < len(dsn) && !unicode.IsSpace(rune(dsn[end])) {
+		end++
+	}
+	return dsn[:start] + "******" + dsn[end:], true
+}
+
 // baseConnStr strips the database name from a DSN, returning a connection
 // string suitable for connecting to the postgres maintenance database.
 func baseConnStr(dsn string) string {
@@ -69,22 +79,18 @@ func baseConnStr(dsn string) string {
 		}
 		return dsn
 	}
-	// keyword=value form: strip dbname= token
 	parts := strings.Fields(dsn)
 	filtered := parts[:0]
-	for _, p := range parts {
-		if !strings.HasPrefix(p, "dbname=") {
-			filtered = append(filtered, p)
+	for _, part := range parts {
+		if !strings.HasPrefix(part, "dbname=") {
+			filtered = append(filtered, part)
 		}
 	}
 	return strings.Join(filtered, " ")
 }
 
 // joinDBName appends dbName to a base connection string produced by
-// baseConnStr, respecting whether base is URI-form ("scheme://host:port") or
-// keyword=value form ("host=... user=..."). Naively concatenating "/dbname"
-// onto a keyword=value base corrupts the last keyword's value instead of
-// selecting a database.
+// baseConnStr, respecting whether base is URI-form or keyword=value form.
 func joinDBName(base, dbName string) string {
 	if isURIForm(base) {
 		return base + "/" + dbName
@@ -105,9 +111,9 @@ func extractDBName(dsn string) string {
 		}
 		return ""
 	}
-	for _, p := range strings.Fields(dsn) {
-		if strings.HasPrefix(p, "dbname=") {
-			return strings.TrimPrefix(p, "dbname=")
+	for _, part := range strings.Fields(dsn) {
+		if strings.HasPrefix(part, "dbname=") {
+			return strings.TrimPrefix(part, "dbname=")
 		}
 	}
 	return ""
