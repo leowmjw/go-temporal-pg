@@ -1,32 +1,28 @@
 // cmd/pgschema is the CLI entry-point for the pgschema worker.
 // Running this binary starts the Temporal worker for all three task queues:
-//   - pgschema-migration  (SchemaMigrationWorkflow)
+//   - pgschema-migration  (SchemaMigrationWorkflow + BaselineWorkflow)
 //   - pgschema-cdc        (CDCStreamWorkflow)
 //   - pgschema-preview    (PreviewCloneWorkflow)
 package main
 
 import (
+	"context"
 	"log/slog"
 	"os"
+	"strings"
 
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
 
 	"github.com/leowmjw/go-temporal-pg/pgschema/internal/activities"
+	"github.com/leowmjw/go-temporal-pg/pgschema/internal/types"
 	"github.com/leowmjw/go-temporal-pg/pgschema/internal/workflow"
 )
 
 func main() {
-	// Go 1.26: slog.NewMultiHandler broadcasts to JSON (for log aggregators) and
-	// text (for human terminals) simultaneously.
 	log := slog.New(slog.NewMultiHandler(
-		slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-			Level:     slog.LevelInfo,
-			AddSource: true,
-		}),
-		slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-			Level: slog.LevelWarn,
-		}),
+		slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo, AddSource: true}),
+		slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}),
 	))
 	slog.SetDefault(log)
 
@@ -49,8 +45,20 @@ func main() {
 		log.Warn("PGSCHEMA_ALERT_WEBHOOK_URL not set; operator paging is disabled")
 	}
 
+	startupInput := types.MigrationInput{
+		ExpectedPgrollVersion:     envOrDefault("PGSCHEMA_EXPECTED_PGROLL_VERSION", "v0.16.2"),
+		RequireExactPgrollVersion: parseBoolEnv("PGSCHEMA_REQUIRE_EXACT_PGROLL_VERSION"),
+	}
+	version, err := pgrollActs.CheckPgrollVersion(context.Background(), startupInput)
+	if err != nil {
+		log.Error("pgroll startup check failed", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	log.Info("pgroll startup check complete", slog.String("pgroll_version", version), slog.String("expected_pgroll_version", startupInput.ExpectedPgrollVersion))
+
 	migrationWorker := worker.New(c, workflow.SchemaMigrationTaskQueue, worker.Options{})
 	migrationWorker.RegisterWorkflow(workflow.SchemaMigrationWorkflow)
+	migrationWorker.RegisterWorkflow(workflow.BaselineWorkflow)
 	migrationWorker.RegisterActivity(pgrollActs)
 	migrationWorker.RegisterActivity(alertActs)
 
@@ -65,7 +73,6 @@ func main() {
 	previewWorker.RegisterActivity(alertActs)
 
 	log.Info("pgschema workers starting")
-
 	if err := migrationWorker.Start(); err != nil {
 		log.Error("migration worker failed", slog.String("error", err.Error()))
 		os.Exit(1)
@@ -84,4 +91,16 @@ func main() {
 	cdcWorker.Stop()
 	previewWorker.Stop()
 	log.Info("pgschema workers stopped")
+}
+
+func envOrDefault(key, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func parseBoolEnv(key string) bool {
+	value := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	return value == "1" || value == "true" || value == "yes" || value == "y"
 }
