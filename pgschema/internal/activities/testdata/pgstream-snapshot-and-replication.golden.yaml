@@ -1,0 +1,64 @@
+source:
+    postgres:
+        url: postgres://source
+        mode: snapshot_and_replication
+        snapshot:
+            mode: full
+            tables:
+                - public.*
+            excluded_tables:
+                - audit.events
+            schema_only_tables:
+                - audit.*
+            snapshot_workers: 2
+            data:
+                schema_workers: 3
+                table_workers: 4
+                batch_bytes: 1024
+                max_connections: 5
+            schema:
+                pgdump_pgrestore:
+                    clean_target_db: true
+                    create_target_db: true
+                    dump_file: snapshot.sql
+            recorder:
+                repeatable_snapshots: true
+                postgres_url: postgres://target
+        replication:
+            replication_slot: slot1
+            plugin:
+                add_tables: public.*
+                filter_tables: audit.events
+target:
+    postgres:
+        url: postgres://target
+        max_connections: 20
+        on_conflict_action: nothing
+        strict_mode: true
+        ignore_ddl: true
+        include_ddl_object_types:
+            - tables
+        batch:
+            timeout: 1000
+            size: 500
+            max_bytes: 2048
+            max_queue_bytes: 4096
+        bulk_ingest:
+            enabled: true
+            copy_workers: 2
+modifiers:
+    filter:
+        include_tables:
+            - public.*
+        exclude_tables:
+            - audit.events
+        schema_only_tables:
+            - audit.*
+    transformations:
+        validation_mode: strict
+        table_transformers:
+            - schema: public
+              table: users
+              column_transformers:
+                email:
+                    name: email
