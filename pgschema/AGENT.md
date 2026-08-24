@@ -215,3 +215,66 @@ SSE wire-format exactness is pinned by `TestSSEWireFormat`
   in a way that looks like the wrong branch was taken, `grep` the actual file
   content for the literal you meant to write before assuming the parsing code
   is wrong.
+
+## Cleanup / refactor backlog
+
+Identified in session 2026-08-24. Listed by priority.
+
+### 1. Remove `PollLag` activity — dead code, duplicates workflow guardrail logic (HIGH)
+
+`CDCStreamWorkflow` (`internal/workflow/cdc_stream.go`) has an inline goroutine
+that calls `GetStreamHealth` on a timer and enforces guardrails (MaxLagBytes,
+MaxConsecutivePollFailures, OnViolation). `PollLag` is a separate Temporal
+activity in `internal/activities/pgstream.go` that re-implements the same logic
+independently. The workflow **never dispatches `PollLag`** — it is registered
+(because `RegisterActivity(pgstreamActs)` registers all methods on the struct)
+but never called via `workflow.ExecuteActivity`. Safe to delete:
+
+- `func (a *PgstreamActivities) PollLag(...)` (~55 lines)
+- `PollLagFn` field on `PgstreamActivities`
+- `PollLag` tests in `internal/activities/pgstream_test.go`
+  (`TestPollLag_TicksAndStops`, `TestPollLag_ErrorsTolerated`,
+  `TestPollLag_Heartbeats`) — all test an activity the workflow never calls
+
+### 2. Remove `GetLag` activity — thin wrapper, dead code (HIGH)
+
+`GetLag` delegates entirely to `defaultGetLag → defaultGetHealth`, returning only
+`health.LagBytes`. It is never dispatched by the workflow; it exists only to
+support `PollLag`. Remove:
+
+- `func (a *PgstreamActivities) GetLag(...)` (~12 lines)
+- `GetLagFn` field on `PgstreamActivities`
+- `defaultGetLag` private function (~8 lines)
+- `GetLag` tests in `internal/activities/pgstream_test.go`
+  (`TestGetLag_Success`, `TestGetLag_Error`)
+
+Keep `defaultGetHealth` — it is used by `GetStreamHealth`, which the workflow
+does call.
+
+### 3. Fix stale comments in `cdc_stream_test.go` (LOW)
+
+Lines 44 and 355 say "Lag is populated by the PollLag goroutine" / "recent
+PollLag activity result". The workflow goroutine actually calls `GetStreamHealth`
+(not `PollLag`). Update comments to match the real mechanism.
+
+### 4. Export / deduplicate `redactDSN` (LOW)
+
+`cmd/pgschema-demo/main.go` contains `redactForLog`, a local copy of
+`internal/activities.redactDSN`. The comment in `main.go` acknowledges the
+duplication. Simplest fix: export `RedactDSN` from the `activities` package (or
+move to `internal/dsn`) and use it from `cmd/pgschema-demo/main.go`.
+
+### 5. `QueryStreamLag` convenience query (DEFER)
+
+`"lag"` query returns a subset of `"health"`. Not wrong; keep unless the API
+surface is being deliberately narrowed. No action required.
+
+---
+
+**Validation after cleanup** (from `pgschema/`):
+```
+go vet ./...
+go test ./...
+go build ./...
+```
+All three must stay green. `go test -race ./...` preferred if time permits.
