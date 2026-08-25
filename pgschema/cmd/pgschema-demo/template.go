@@ -44,6 +44,11 @@ const indexHTML = `<!doctype html>
   button:disabled { opacity: .4; cursor: not-allowed; }
   button.danger { background: var(--bad); }
   button.good { background: var(--good); }
+  button.reset {
+    font-size: 1rem; font-weight: 700; padding: .85rem 1.75rem;
+    box-shadow: 0 0 0 3px rgba(224,85,95,.25);
+  }
+  button.reset:hover:not(:disabled) { background: #ff6b74; }
   .row { display: flex; gap: .5rem; flex-wrap: wrap; margin-top: .5rem; }
   .kv { display: grid; grid-template-columns: auto 1fr; gap: .35rem .75rem; font-size: .9rem; margin-bottom: 1rem; }
   .kv dt { color: var(--muted); }
@@ -60,11 +65,18 @@ const indexHTML = `<!doctype html>
   .badge.idle { background: rgba(144,152,171,.15); color: var(--muted); }
 </style>
 </head>
-<body data-signals="{phase:'idle',status:'idle',percent:0,message:'',workflowId:'',runId:''}"
+<body data-signals="{phase:'idle',status:'idle',percent:0,message:'',workflowId:'',runId:'',resetting:false}"
       data-init="@get('/status')">
 
 <h1>pgschema demo</h1>
 <p class="subtitle">Zero-downtime pgroll schema migrations, orchestrated live by a Temporal workflow. Click a scenario to run it against the demo database.</p>
+
+<div style="margin-bottom:1.5rem">
+  <button class="danger reset"
+    data-on:click="confirm('Reset the demo database? This wipes all progress — scenarios will need to be re-run from #1.') && @post('/reset')"
+    data-attr:disabled="$resetting"
+    data-text="$resetting ? '⏳ Resetting…' : '🔄 Demo stuck? Reset database'"></button>
+</div>
 
 <main>
   <section class="panel" id="scenarios">

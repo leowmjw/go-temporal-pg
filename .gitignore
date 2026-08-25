@@ -39,3 +39,7 @@ tmp/
 
 # Ignore mise config
 mise.local.toml
+
+# Ignore binaries
+pgschema-demo
+

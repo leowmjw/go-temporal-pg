@@ -46,6 +46,39 @@ Temporal's own Web UI is at http://localhost:8233 if you want to show the
 actual workflow history/event timeline alongside the demo page — the
 workflow IDs are `demo-<scenario>-<unix-ts>`.
 
+## Step-by-step: how to click through it
+
+The page at http://localhost:8090 is **one** page: a list of scenario cards
+(each with its own **Run** button) on top, and a single shared status
+panel below them that always reflects whichever scenario you last started.
+There's nothing per-scenario to scroll to — just work top to bottom, one
+card at a time:
+
+1. Click **Run** on the **scenario 1** card.
+2. Watch the status panel: `phase` moves
+   `validating → starting → waiting_for_app_ready`.
+3. Once it's parked on `waiting_for_app_ready`, a green
+   **✅ Send app-ready** button appears in the status panel — click it.
+   (This simulates your deploy pipeline confirming the new app version is
+   live.)
+4. `phase` moves on to `completing → verifying`, then `status` flips to
+   `completed`. That scenario is done.
+5. Click **Run** on the **scenario 2** card next, and repeat steps 2–4.
+   Continue through scenarios **3, 4, 5** the same way, always in numeric
+   order — each one alters the schema the next one depends on (e.g. #5
+   reads the `display_name` column that #3 creates).
+6. Optional detour: **scenario 5b** (rollback walkthrough) can be run any
+   time after #1. Click its **Run**, wait for `waiting_for_app_ready` like
+   before, but this time click the red **⛔ Abort / rollback** button
+   instead of app-ready — watch the workflow compensate via
+   `pgroll rollback` rather than complete.
+7. Optional bonus: **scenario 6** (Postgres 18 `uuidv7()`) — same Run →
+   app-ready flow, no dependency on the others.
+
+The activity log at the bottom of the page timestamps every step of
+whichever run is currently selected, so if you're not sure what the
+workflow is doing, that's the place to look.
+
 ## The 5 scenarios (+2 bonus)
 
 All operate on one evolving `users` table, basic → complex:
@@ -74,25 +107,36 @@ live and reading/writing the new column). **Abort / rollback** sends the
 `rollback` signal, which the workflow picks up and compensates via
 `pgroll rollback` instead of completing.
 
-Click a scenario, watch:
-1. `phase` step through `validating → starting → waiting_for_app_ready`
-2. the **Send app-ready** button appear once it's actually waiting on you
-3. `phase → completing → verifying`, `status → completed`
-4. the activity log (bottom panel) tracking every step with a timestamp
-
-Run scenarios in order (1 → 6) — each depends on the schema state the
-previous one left behind (e.g. #5 reads `display_name`, which only exists
-after #3 has run).
+See "Step-by-step: how to click through it" above for the exact sequence.
 
 ## Resetting
 
+There's a **🔄 Demo stuck? Reset database** button at the top of the page —
+click it (it'll ask you to confirm), and it wipes and reseeds the demo
+schema and re-baselines it with pgroll, streaming progress into the
+activity log below. Use it any time the demo gets into a bad state: a
+failed workflow, a scenario run out of order, or anything else the UI can't
+recover from on its own.
+
+This is a *schema-level* reset (`DROP SCHEMA ... CASCADE` + reseed +
+`pgroll init`/`baseline`) against the already-running Postgres container —
+it deliberately does **not** run `mise run demo-reset`'s
+`docker compose down`. Tearing down that container from inside a request
+handler would stop the same containers the `postgres` line in the dev
+Procfile is attached to, which makes *that* process exit — and since
+`mise run dev` runs everything under `overmind`, one managed process dying
+takes the whole session (temporal, worker, web) down with it. The in-page
+button avoids that entirely.
+
 ```sh
-mise run demo-reset
+mise run demo-reset   # equivalent, but full container teardown — run this
+                       # from a terminal, not from the page, and expect
+                       # `mise run dev` to need restarting after
 ```
 
-Safe to run anytime between scenarios or after a mistake — it's a
-throwaway Docker volume. You'll need to re-run scenarios 1→N in order again
-afterward, since state doesn't persist across a reset.
+Either way it's safe to run anytime between scenarios or after a mistake.
+You'll need to re-run scenarios 1→N in order again afterward, since state
+doesn't persist across a reset.
 
 ## Troubleshooting
 

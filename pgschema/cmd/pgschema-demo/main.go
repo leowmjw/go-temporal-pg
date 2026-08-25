@@ -13,6 +13,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
@@ -22,11 +23,13 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"go.temporal.io/sdk/client"
 
 	"github.com/leowmjw/go-temporal-pg/pgschema/internal/activities"
@@ -113,6 +116,7 @@ type server struct {
 	dsn           string
 	schema        string
 	migrationsDir string
+	seedFile      string
 
 	mu      sync.Mutex
 	current *run
@@ -123,6 +127,7 @@ func main() {
 	dsn := flag.String("dsn", envOr("PGROLL_DSN", "postgres://postgres:postgres@localhost:5432/pgschema_demo?sslmode=disable"), "DSN of the demo Postgres database (see demo/docker-compose.yml)")
 	schemaName := flag.String("schema", envOr("SCHEMA", "public"), "pgroll-managed schema name")
 	migrationsDir := flag.String("migrations", "./demo/migrations", "directory containing the scenario migration JSON files")
+	seedFile := flag.String("seed", "./demo/init/001_seed_users.sql", "SQL file used to reseed the users table on reset")
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -143,6 +148,7 @@ func main() {
 		dsn:           *dsn,
 		schema:        *schemaName,
 		migrationsDir: *migrationsDir,
+		seedFile:      *seedFile,
 	}
 
 	mux := http.NewServeMux()
@@ -151,6 +157,7 @@ func main() {
 	mux.HandleFunc("POST /scenario/{id}/start", srv.handleStartScenario)
 	mux.HandleFunc("POST /signal/app-ready", srv.handleSignal(workflow.SignalAppReady, "app-ready"))
 	mux.HandleFunc("POST /signal/rollback", srv.handleSignal(workflow.SignalRollback, "rollback"))
+	mux.HandleFunc("POST /reset", srv.handleReset)
 
 	log.Info("pgschema demo web UI listening", slog.String("addr", *addr), slog.String("dsn", activities.RedactDSN(*dsn)))
 	if err := http.ListenAndServe(*addr, mux); err != nil {
@@ -360,6 +367,120 @@ func (s *server) handleSignal(signalName, label string) http.HandlerFunc {
 		}
 		patchElements(w, f, "#log-lines", "append", logLine(fmt.Sprintf("[%s] sent %q signal", cur.WorkflowID, label)))
 	}
+}
+
+// ─── Reset (recover from a stuck/bad demo state) ──────────────────────────
+
+// handleReset wipes and reseeds the demo schema, then re-runs `pgroll init`
+// + `pgroll baseline`, streaming progress into the activity log. It's the
+// escape hatch for when the demo gets into a state the UI can't recover
+// from on its own (a failed workflow, a scenario run out of order, a stale
+// `current` run).
+//
+// Deliberately does NOT touch the Postgres container (no `docker compose
+// down`/`up`, i.e. NOT `mise run demo-reset`): that command is owned by the
+// `postgres` line in the dev Procfile, and stopping those containers out
+// from under it makes that foreground process exit — which overmind treats
+// as one of its managed processes dying, and it tears down the *entire*
+// `mise run dev` session (temporal, worker, web included) in response. A
+// schema-level wipe gets the same "start scenario 1 from a clean slate"
+// result without taking down anything else.
+func (s *server) handleReset(w http.ResponseWriter, r *http.Request) {
+	f := sseHeaders(w)
+
+	// Whatever was in flight is meaningless once the schema gets wiped.
+	s.mu.Lock()
+	s.current = nil
+	s.mu.Unlock()
+
+	_ = patchSignals(w, f, map[string]any{
+		"resetting": true, "phase": "idle", "status": "idle", "percent": 0,
+		"message": "", "workflowId": "", "runId": "",
+	})
+	logf := func(msg string) { patchElements(w, f, "#log-lines", "append", logLine(msg)) }
+	logf("resetting demo database (schema wipe + reseed + pgroll init)…")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	if err := s.resetDatabase(ctx, logf); err != nil {
+		logf("reset failed: " + err.Error())
+	} else {
+		logf("demo database reset — ready to run scenario 1")
+	}
+	_ = patchSignals(w, f, map[string]any{"resetting": false})
+}
+
+// resetDatabase drops and recreates the demo schema (plus pgroll's own
+// `pgroll` state schema), reseeds it from seedFile, and re-baselines it with
+// pgroll — the same end state `mise run demo-init` produces against a fresh
+// container, but performed in place against the running Postgres.
+func (s *server) resetDatabase(ctx context.Context, logf func(string)) error {
+	conn, err := pgx.Connect(ctx, s.dsn)
+	if err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	defer conn.Close(ctx)
+
+	logf(fmt.Sprintf("dropping schema %q and pgroll's state schema", s.schema))
+	if _, err := conn.Exec(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", pgx.Identifier{s.schema}.Sanitize())); err != nil {
+		return fmt.Errorf("drop schema %s: %w", s.schema, err)
+	}
+	if _, err := conn.Exec(ctx, fmt.Sprintf("CREATE SCHEMA %s", pgx.Identifier{s.schema}.Sanitize())); err != nil {
+		return fmt.Errorf("recreate schema %s: %w", s.schema, err)
+	}
+	if _, err := conn.Exec(ctx, "DROP SCHEMA IF EXISTS pgroll CASCADE"); err != nil {
+		return fmt.Errorf("drop pgroll state schema: %w", err)
+	}
+
+	logf("reseeding from " + s.seedFile)
+	seedSQL, err := os.ReadFile(s.seedFile)
+	if err != nil {
+		return fmt.Errorf("read seed file: %w", err)
+	}
+	if _, err := conn.Exec(ctx, string(seedSQL)); err != nil {
+		return fmt.Errorf("run seed sql: %w", err)
+	}
+
+	if err := s.runStreamed(ctx, logf, "pgroll", "--postgres-url", s.dsn, "--schema", s.schema, "init"); err != nil {
+		return fmt.Errorf("pgroll init: %w", err)
+	}
+
+	baselineDir := ".data/pgroll-baseline"
+	if err := os.MkdirAll(baselineDir, 0o755); err != nil {
+		return fmt.Errorf("create baseline dir: %w", err)
+	}
+	if err := s.runStreamed(ctx, logf, "pgroll", "--postgres-url", s.dsn, "--schema", s.schema, "baseline", "00_baseline", baselineDir, "-y"); err != nil {
+		return fmt.Errorf("pgroll baseline: %w", err)
+	}
+	return nil
+}
+
+// runStreamed runs a command, streaming each line of its combined
+// stdout/stderr into logf as it happens (rather than buffering it all until
+// exit) so a slow step like pgroll init is visible in the activity log
+// while it's running, not just after.
+func (s *server) runStreamed(ctx context.Context, logf func(string), name string, args ...string) error {
+	cmd := exec.CommandContext(ctx, name, args...)
+	pr, pw := io.Pipe()
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+		pw.Close()
+	}()
+
+	scanner := bufio.NewScanner(pr)
+	for scanner.Scan() {
+		logf(scanner.Text())
+	}
+	return <-done
 }
 
 // ─── SSE helpers (Datastar v1.0.2 wire protocol: datastar-patch-signals /

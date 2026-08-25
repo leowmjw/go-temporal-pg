@@ -86,7 +86,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	worker.InterruptCh()
+	<-worker.InterruptCh()
 	migrationWorker.Stop()
 	cdcWorker.Stop()
 	previewWorker.Stop()

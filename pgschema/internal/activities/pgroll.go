@@ -11,8 +11,23 @@ import (
 	"strings"
 	"time"
 
+	"go.temporal.io/sdk/temporal"
+
 	"github.com/leowmjw/go-temporal-pg/pgschema/internal/types"
 )
+
+// nonRetryableIfAlreadyApplied wraps a validate/start failure in a
+// non-retryable Temporal application error when it's an "already applied"
+// condition (see IsAlreadyAppliedError): retrying it burns through the
+// activity's whole backoff schedule (5 attempts, up to ~30s) for an error
+// that is deterministic and will never succeed on retry — the workflow's
+// idempotent-skip handling only needs to see it once.
+func nonRetryableIfAlreadyApplied(wrapped *types.MigrationError) error {
+	if IsAlreadyAppliedError(wrapped.Wrapped) {
+		return temporal.NewNonRetryableApplicationError(wrapped.Error(), "pgroll-already-applied", wrapped)
+	}
+	return wrapped
+}
 
 const defaultExpectedPgrollVersion = "v0.16.2"
 
@@ -65,7 +80,7 @@ func (a *PgrollActivities) ValidateMigration(ctx context.Context, input types.Mi
 	err := a.ValidateFn(ctx, input)
 	end(err)
 	if err != nil {
-		return &types.MigrationError{Phase: "validate", Wrapped: err}
+		return nonRetryableIfAlreadyApplied(&types.MigrationError{Phase: "validate", Wrapped: err})
 	}
 	return nil
 }
@@ -78,7 +93,7 @@ func (a *PgrollActivities) StartMigration(ctx context.Context, input types.Migra
 	safeHeartbeat(ctx, "started")
 	end(err)
 	if err != nil {
-		return &types.MigrationError{Phase: "start", Wrapped: err}
+		return nonRetryableIfAlreadyApplied(&types.MigrationError{Phase: "start", Wrapped: err})
 	}
 	return nil
 }
@@ -279,13 +294,25 @@ func (a *PgrollActivities) defaultReconcile(ctx context.Context, input types.Rec
 	if err != nil {
 		return nil, err
 	}
-	migrationName := parseMigrationName(input.Migration.MigrationJSON)
+	result := reconcileDecision(input.Phase, status, input.Migration.MigrationJSON)
+	a.logger().InfoContext(ctx, "pgroll reconciliation decision", slog.String("phase", input.Phase), slog.String("action", result.Action), slog.String("reason", result.Reason), slog.String("status", status.Status), slog.String("version", status.EffectiveVersion()))
+	return result, nil
+}
+
+// reconcileDecision is the pure decision logic behind defaultReconcile,
+// split out so it can be unit tested against every pgroll status shape
+// without a real pgroll binary or database. It is deliberately independent
+// of I/O — given a phase, the pgroll status query result, and the
+// migration's own JSON, it decides whether the workflow should continue,
+// skip, resume, or fail.
+func reconcileDecision(phase string, status *types.MigrationStatus, migrationJSON string) *types.ReconciliationResult {
+	migrationName := migrationIdentity(migrationJSON)
 	statusText := strings.ToLower(strings.TrimSpace(status.Status))
 	currentVersion := status.EffectiveVersion()
 	matchesCurrent := migrationName != "" && currentVersion == migrationName
 
 	result := &types.ReconciliationResult{Action: reconcileActionContinue, Status: status}
-	switch input.Phase {
+	switch phase {
 	case "before_start":
 		switch {
 		case strings.Contains(statusText, "in progress") && matchesCurrent:
@@ -303,32 +330,49 @@ func (a *PgrollActivities) defaultReconcile(ctx context.Context, input types.Rec
 		case strings.Contains(statusText, "complete") && matchesCurrent:
 			result.Action = reconcileActionSkipComplete
 			result.Reason = "pgroll already completed this migration"
-		case strings.Contains(statusText, "in progress") && matchesCurrent:
+		case strings.Contains(statusText, "in progress") && (matchesCurrent || migrationName == ""):
+			// migrationName is content-addressable (see MigrationFileName in
+			// base.go) so matchesCurrent reliably holds in the honest
+			// happy-path case: this workflow's own StartMigration call wrote
+			// the same content to the same deterministically-named temp
+			// file pgroll is now reporting as the in-progress version.
+			// migrationName=="" only happens if MigrationJSON was empty
+			// (shouldn't occur past validate) — fail open rather than block
+			// the happy path on that edge case.
 			result.Action = reconcileActionContinue
 		default:
 			result.Action = reconcileActionFail
 			result.Reason = fmt.Sprintf("unexpected pgroll status before complete: status=%q version=%q migration=%q", status.Status, currentVersion, migrationName)
 		}
 	case "before_rollback":
+		// pgroll rollback only ever succeeds when a migration is actively
+		// mid-flight ("in progress"); calling it in any other state fails
+		// with "no active migration" (confirmed against the real binary).
+		// So the safe default here is to skip unless status genuinely shows
+		// something in progress — not the inverse (attempt unless we can
+		// positively identify a reason not to), which is what let a stale
+		// "Complete" status through into a doomed rollback attempt whenever
+		// migrationName was empty (see IsNoActiveMigrationError).
 		switch {
-		case strings.Contains(statusText, "in progress") && matchesCurrent:
-			result.Action = reconcileActionContinue
-		case strings.Contains(statusText, "complete") && matchesCurrent:
+		case strings.Contains(statusText, "in progress") && migrationName != "" && currentVersion != "" && currentVersion != migrationName:
+			// A different migration than the one this workflow is managing
+			// is in progress — leave it alone, it isn't ours to roll back.
 			result.Action = reconcileActionSkipRollback
-			result.Reason = "pgroll already completed this migration"
+			result.Reason = fmt.Sprintf("pgroll is on different version %q", currentVersion)
+		case strings.Contains(statusText, "in progress"):
+			result.Action = reconcileActionContinue
 		case strings.Contains(statusText, "no migrations"):
 			result.Action = reconcileActionSkipRollback
 			result.Reason = "pgroll reports no active migration to roll back"
 		case strings.Contains(statusText, "roll"):
 			result.Action = reconcileActionSkipRollback
 			result.Reason = "pgroll already reports a rolled back state"
-		case migrationName != "" && currentVersion != "" && currentVersion != migrationName:
+		default:
 			result.Action = reconcileActionSkipRollback
-			result.Reason = fmt.Sprintf("pgroll is on different version %q", currentVersion)
+			result.Reason = fmt.Sprintf("pgroll status %q is not \"in progress\" — nothing to roll back", status.Status)
 		}
 	}
-	a.logger().InfoContext(ctx, "pgroll reconciliation decision", slog.String("phase", input.Phase), slog.String("action", result.Action), slog.String("reason", result.Reason), slog.String("status", status.Status), slog.String("version", currentVersion))
-	return result, nil
+	return result
 }
 
 func (a *PgrollActivities) defaultBaseline(ctx context.Context, input types.BaselineInput) (*types.BaselineResult, error) {
@@ -385,6 +429,64 @@ func (a *PgrollActivities) defaultBaseline(ctx context.Context, input types.Base
 	}, nil
 }
 
+// ─── pgroll error classification ──────────────────────────────────────────
+//
+// pgroll's CLI errors fall into two buckets the workflow needs to treat
+// differently:
+//
+//  1. Recoverable / idempotent: the requested change is already present, or
+//     there's nothing active to act on. These happen naturally when an
+//     operation is retried or a UI action (e.g. clicking "Run" on a
+//     scenario that already completed) fires the same migration twice —
+//     they are not evidence anything is broken, and treating them as a
+//     hard failure produces a misleading rollback attempt that itself
+//     fails (see IsNoActiveMigrationError below).
+//
+//     Confirmed against the real v0.16.2 binary:
+//       `pgroll validate 01_add_email.json` (column already added):
+//         Error: migration '01_add_email' is invalid: column "email"
+//         already exists in table "users"
+//       `pgroll rollback` (nothing in progress):
+//         Error: unable to get active migration: no active migration
+//
+//  2. Non-recoverable: anything else (lock timeouts, syntax errors,
+//     constraint violations, connection failures, ...) — these must
+//     continue to trigger the workflow's normal rollback + operator-page
+//     path unchanged.
+
+// IsAlreadyAppliedError reports whether a pgroll validate/start error means
+// the migration's changes are already present in the target schema — e.g.
+// from running the exact same migration twice (a stuck UI, a double click,
+// a retried activity). This is recoverable: pgroll never got far enough to
+// apply anything new, so there is nothing to compensate.
+func IsAlreadyAppliedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	needles := []string{"already exists", "already applied"}
+	for _, n := range needles {
+		if strings.Contains(msg, n) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsNoActiveMigrationError reports whether a pgroll rollback error means
+// there was nothing in progress to roll back. pgroll returns this when
+// asked to compensate a migration that was never started (or already
+// completed) — most commonly because a validate failure triggered rollback
+// for a migration whose changes were already applied by an earlier run and
+// that therefore never reached `start` this time around.
+func IsNoActiveMigrationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no active migration") || strings.Contains(msg, "unable to get active migration")
+}
+
 func parsePgrollStatusOutput(out []byte) (*types.MigrationStatus, error) {
 	var s types.MigrationStatus
 	if err := json.Unmarshal(out, &s); err != nil {
@@ -424,7 +526,7 @@ func analyzeMigrationRisk(input types.MigrationInput) (*types.MigrationRiskRepor
 		return nil, err
 	}
 	report := &types.MigrationRiskReport{
-		MigrationName: doc.Name,
+		MigrationName: migrationIdentity(input.MigrationJSON),
 		OverallRisk:   "low",
 		Summary:       "migration contains no elevated-risk operations",
 	}
@@ -461,8 +563,11 @@ func analyzeMigrationRisk(input types.MigrationInput) (*types.MigrationRiskRepor
 	return report, nil
 }
 
+// migrationDocument has no "name" field: pgroll v0.16.2 rejects a top-level
+// "name" key outright ("unknown field \"name\""), confirmed against the
+// real binary — so no valid migration JSON this package hands to pgroll can
+// ever carry one. See migrationIdentity for how names are derived instead.
 type migrationDocument struct {
-	Name       string                       `json:"name"`
 	Operations []map[string]json.RawMessage `json:"operations"`
 }
 
@@ -478,12 +583,17 @@ func parseMigrationDocument(raw string) (*migrationDocument, error) {
 	return &doc, nil
 }
 
-func parseMigrationName(raw string) string {
-	doc, err := parseMigrationDocument(raw)
-	if err != nil {
+// migrationIdentity is the name reconcileDecision compares against pgroll's
+// reported current version to tell whether pgroll's state refers to THIS
+// exact migration content. It must match MigrationFileName in base.go
+// (minus the ".json" pgroll strips when deriving a migration's name from
+// the file it was given) — same hash, same truncation — since that's the
+// filename pgroll actually saw when this migration was run.
+func migrationIdentity(migrationJSON string) string {
+	if strings.TrimSpace(migrationJSON) == "" {
 		return ""
 	}
-	return strings.TrimSpace(doc.Name)
+	return strings.TrimSuffix(MigrationFileName(migrationJSON), ".json")
 }
 
 func classifyOperationRisk(defaultSchema string, policy types.MigrationPolicy, opName string, body json.RawMessage) *types.MigrationRiskFinding {

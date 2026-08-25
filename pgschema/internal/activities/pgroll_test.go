@@ -421,6 +421,159 @@ func TestReconcileMigrationState_AlreadyComplete(t *testing.T) {
 	assert.Equal(t, "add_email", result.Status.Version)
 }
 
+// ── reconcileDecision — double-run / already-applied regression coverage ──────
+//
+// Repro (confirmed against the real pgroll v0.16.2 binary + a live demo
+// Postgres): running the same scenario twice — e.g. a double click on "Run",
+// or re-clicking a scenario after it already completed — left the SECOND
+// workflow run in this sequence:
+//   1. `pgroll validate` on the already-applied migration fails:
+//        `migration '01_add_email' is invalid: column "email" already
+//        exists in table "users"`
+//   2. The workflow's triggerRollback calls `ReconcileMigrationState`
+//      phase=before_rollback. pgroll's status was "Complete" (nothing in
+//      progress) with no matching migration name — demo migration JSON
+//      files never set one, and pgroll v0.16.2 rejects a top-level "name"
+//      field outright ("unknown field \"name\""), so migrationName is
+//      always empty and the old `matchesCurrent` gate could never be true.
+//      Because none of the "before_rollback" cases matched, the decision
+//      fell through to the zero-value action "continue" instead of a
+//      skip — a real `pgroll rollback` was attempted.
+//   3. `pgroll rollback` against a "Complete" (no active migration) state
+//      fails: `unable to get active migration: no active migration`.
+//   4. The workflow treated this as rollback failure: paged the operator
+//      at "critical" severity and returned status "rollback_failed" —
+//      alarming and wrong for what is actually a harmless no-op.
+//
+// These tests pin the fixed behavior directly against reconcileDecision
+// (the pure decision table defaultReconcile now delegates to), so any
+// future edit that reintroduces the fall-through-to-continue bug fails
+// immediately without needing a live pgroll binary or database.
+
+func TestReconcileDecision_BeforeRollback_NothingInProgress_Skips(t *testing.T) {
+	// The exact repro state: migration already completed, no name to match
+	// against (as with every demo/*.json migration file today).
+	status := &types.MigrationStatus{Schema: "public", Status: "Complete", Version: "pgroll-migration-632793991"}
+	result := reconcileDecision("before_rollback", status, `{"operations":[]}`)
+
+	require.Equal(t, reconcileActionSkipRollback, result.Action, "must skip, not attempt a doomed pgroll rollback")
+	assert.NotEmpty(t, result.Reason)
+}
+
+func TestReconcileDecision_BeforeRollback_NoMigrations_Skips(t *testing.T) {
+	status := &types.MigrationStatus{Schema: "public", Status: "No migrations"}
+	result := reconcileDecision("before_rollback", status, `{"operations":[]}`)
+	assert.Equal(t, reconcileActionSkipRollback, result.Action)
+}
+
+func TestReconcileDecision_BeforeRollback_InProgress_MatchingIdentity_Continues(t *testing.T) {
+	// The happy path: a genuinely in-flight migration, where pgroll's
+	// reported version is the content-addressable name this workflow's own
+	// StartMigration call would have produced for this exact JSON (see
+	// MigrationFileName/migrationIdentity) — rollback must be attempted.
+	migrationJSON := `{"operations":[{"add_column":{"table":"users","column":{"name":"email","type":"text"}}}]}`
+	status := &types.MigrationStatus{Schema: "public", Status: "In progress", Version: migrationIdentity(migrationJSON)}
+	result := reconcileDecision("before_rollback", status, migrationJSON)
+	assert.Equal(t, reconcileActionContinue, result.Action)
+}
+
+func TestReconcileDecision_BeforeRollback_DifferentMigrationInProgress_Skips(t *testing.T) {
+	// A different, named migration than the one we're tracking is active —
+	// must not roll back someone else's in-flight change.
+	status := &types.MigrationStatus{Schema: "public", Status: "In progress", Version: "some-other-migration"}
+	result := reconcileDecision("before_rollback", status, `{"name":"add_email","operations":[]}`)
+	assert.Equal(t, reconcileActionSkipRollback, result.Action)
+}
+
+func TestReconcileDecision_BeforeComplete_InProgress_MatchingIdentity_Continues(t *testing.T) {
+	// The happy path: pgroll status="In progress" during before_complete,
+	// with a matching content-addressable version (see MigrationFileName).
+	migrationJSON := `{"operations":[{"add_column":{"table":"users","column":{"name":"email","type":"text"}}}]}`
+	status := &types.MigrationStatus{Schema: "public", Status: "In progress", Version: migrationIdentity(migrationJSON)}
+	result := reconcileDecision("before_complete", status, migrationJSON)
+	assert.Equal(t, reconcileActionContinue, result.Action)
+}
+
+func TestReconcileDecision_BeforeComplete_InProgress_NoName_Continues(t *testing.T) {
+	// Edge case: MigrationJSON is empty (shouldn't happen past validate) —
+	// migrationIdentity returns "", and the decision fails open rather than
+	// blocking the happy path on an identity it can't compute.
+	status := &types.MigrationStatus{Schema: "public", Status: "In progress", Version: "pgroll-migration-1626957683"}
+	result := reconcileDecision("before_complete", status, "")
+	assert.Equal(t, reconcileActionContinue, result.Action)
+}
+
+// ── reconcileDecision — before_start, content-addressable identity ────────────
+//
+// Regression coverage for the second double-run bug: re-running scenario 3
+// (a rename: `full_name` -> `display_name`) failed validate with `column
+// "full_name" does not exist on table "users"` — the flip side of
+// "already exists": a rename/drop op references a name the FIRST run
+// already made disappear. Matching by CLI error text can't cover this
+// without also risking swallowing a genuinely different, broken migration
+// (e.g. running scenario 5 before scenario 3, which fails with a similarly
+// shaped "does not exist" error but is NOT a duplicate — see demo/README.md
+// Troubleshooting). Content-addressable migration names (MigrationFileName)
+// let before_start recognize "this exact migration already fully applied"
+// BEFORE validate ever runs, for any operation type — no error-text
+// matching involved, and a different migration against the same "Complete"
+// status is left alone to validate (and fail) normally.
+
+func TestReconcileDecision_BeforeStart_MatchingComplete_AlreadyComplete(t *testing.T) {
+	migrationJSON := `{"operations":[{"rename_column":{"table":"users","from":"full_name","to":"display_name"}}]}`
+	status := &types.MigrationStatus{Schema: "public", Status: "Complete", Version: migrationIdentity(migrationJSON)}
+	result := reconcileDecision("before_start", status, migrationJSON)
+	assert.Equal(t, reconcileActionAlreadyDone, result.Action, "re-submitting an already-applied migration must short-circuit before validate runs")
+}
+
+func TestReconcileDecision_BeforeStart_DifferentCompletedMigration_Continues(t *testing.T) {
+	// A DIFFERENT migration than the last one that completed — e.g. running
+	// scenario 5 before scenario 3 finished. Must NOT be mistaken for a
+	// duplicate: validate needs to run and (correctly) fail.
+	lastCompleted := `{"operations":[{"add_column":{"table":"users","column":{"name":"email","type":"text"}}}]}`
+	thisRequest := `{"operations":[{"rename_column":{"table":"users","from":"display_name","to":"first_name"}}]}`
+	status := &types.MigrationStatus{Schema: "public", Status: "Complete", Version: migrationIdentity(lastCompleted)}
+	result := reconcileDecision("before_start", status, thisRequest)
+	assert.Equal(t, reconcileActionContinue, result.Action, "a distinct migration must proceed to validate, not be swallowed as already-applied")
+}
+
+func TestReconcileDecision_BeforeComplete_UnexpectedStatus_Fails(t *testing.T) {
+	status := &types.MigrationStatus{Schema: "public", Status: "Complete", Version: "some-other-migration"}
+	result := reconcileDecision("before_complete", status, `{"operations":[]}`)
+	assert.Equal(t, reconcileActionFail, result.Action)
+}
+
+// ── pgroll error classification ────────────────────────────────────────────
+
+func TestIsAlreadyAppliedError(t *testing.T) {
+	// Exact text confirmed against the real pgroll v0.16.2 binary.
+	err := &types.MigrationError{Phase: "validate", Wrapped: errors.New(`migration '01_add_email' is invalid: column "email" already exists in table "users"`)}
+	assert.True(t, IsAlreadyAppliedError(err))
+	assert.False(t, IsAlreadyAppliedError(errors.New("lock timeout")))
+	assert.False(t, IsAlreadyAppliedError(nil))
+}
+
+func TestIsNoActiveMigrationError(t *testing.T) {
+	// Exact text confirmed against the real pgroll v0.16.2 binary.
+	err := errors.New("unable to get active migration: no active migration")
+	assert.True(t, IsNoActiveMigrationError(err))
+	assert.False(t, IsNoActiveMigrationError(errors.New("lock timeout")))
+	assert.False(t, IsNoActiveMigrationError(nil))
+}
+
+func TestMigrationIdentity_DeterministicAndDistinct(t *testing.T) {
+	a := `{"operations":[{"add_column":{"table":"users","column":{"name":"email","type":"text"}}}]}`
+	b := `{"operations":[{"add_column":{"table":"users","column":{"name":"status","type":"text"}}}]}`
+
+	assert.Equal(t, migrationIdentity(a), migrationIdentity(a), "same content must hash to the same identity")
+	assert.NotEqual(t, migrationIdentity(a), migrationIdentity(b), "different content must hash to different identities")
+	assert.Empty(t, migrationIdentity(""), "empty migration JSON has no identity")
+
+	// Must match the filename runPgroll (base.go) actually writes to disk —
+	// that's the literal basename pgroll derives its reported version from.
+	assert.Equal(t, MigrationFileName(a), migrationIdentity(a)+".json")
+}
+
 func TestParsePgrollStatusOutput_Malformed(t *testing.T) {
 	_, err := parsePgrollStatusOutput([]byte(`{"status":`))
 	require.Error(t, err)

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	"go.temporal.io/sdk/log"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 
@@ -85,6 +86,14 @@ func SchemaMigrationWorkflow(ctx workflow.Context, input types.MigrationInput) (
 
 	rollbackCh := workflow.GetSignalChannel(ctx, SignalRollback)
 	appReadyCh := workflow.GetSignalChannel(ctx, SignalAppReady)
+	// Per Temporal Go SDK guidance, a signal still sitting in its channel
+	// when the workflow completes is dropped and logged as "Workflow has
+	// unhandled signals" — e.g. a rollback fired after the workflow had
+	// already moved past every point that checks rollbackCh (post
+	// app-ready, mid-complete, etc.). Async-draining both channels on every
+	// exit path turns that into a deliberate no-op instead of SDK-detected
+	// signal loss.
+	defer drainSignalChannels(rollbackCh, appReadyCh)
 
 	actOpts := workflow.ActivityOptions{
 		StartToCloseTimeout: 10 * time.Minute,
@@ -164,14 +173,18 @@ func SchemaMigrationWorkflow(ctx workflow.Context, input types.MigrationInput) (
 		bestEffortStatus()
 	}
 
-	setProgress("validating", 5, progress.Message)
-	if err := workflow.ExecuteActivity(ctx, (*activities.PgrollActivities).ValidateMigration, input).Get(ctx, nil); err != nil {
-		return triggerRollback(ctx, input, progress, err, "validate", roadmapEnabled)
-	}
-	if checkRollback() {
-		return triggerRollback(ctx, input, progress, nil, "post-validate-signal", roadmapEnabled)
-	}
-
+	// Check reconcile("before_start") BEFORE validate: with a content-
+	// addressable migration name (see MigrationFileName/migrationIdentity in
+	// activities/pgroll.go), pgroll reporting this exact migration as
+	// already "Complete" is a reliable signal — not a text-matched guess —
+	// so a double-run (same scenario clicked twice, or re-clicked after it
+	// already finished) short-circuits here before validate ever gets a
+	// chance to fail on a schema this migration already changed (e.g.
+	// `column "email" already exists`, or the rename/drop flip side,
+	// `column "full_name" does not exist` once it's already been renamed
+	// away). A genuinely different migration against the same "Complete"
+	// status (wrong-order Run click, unrelated bug) won't match and falls
+	// through to validate as normal.
 	shouldStart := true
 	if roadmapEnabled {
 		bestEffortStatus()
@@ -196,6 +209,25 @@ func SchemaMigrationWorkflow(ctx workflow.Context, input types.MigrationInput) (
 	}
 
 	if shouldStart {
+		setProgress("validating", 5, progress.Message)
+		if err := workflow.ExecuteActivity(ctx, (*activities.PgrollActivities).ValidateMigration, input).Get(ctx, nil); err != nil {
+			if activities.IsAlreadyAppliedError(err) {
+				// Defense in depth: reconcile above should have already
+				// caught an already-applied double-run via matching
+				// identity. This only fires if that check errored/was
+				// skipped (non-roadmap replay) and validate's own error
+				// text still recognizably means "already applied".
+				bestEffortStatus()
+				setProgress("completed", 100, friendlyAlreadyAppliedMessage(ctx, logger, err, "validate"))
+				progress.Status = "completed"
+				return progress, nil
+			}
+			return triggerRollback(ctx, input, progress, err, "validate", roadmapEnabled)
+		}
+		if checkRollback() {
+			return triggerRollback(ctx, input, progress, nil, "post-validate-signal", roadmapEnabled)
+		}
+
 		setProgress("starting", 20, progress.Message)
 		startOpts := actOpts
 		startOpts.StartToCloseTimeout = 30 * time.Minute
@@ -287,6 +319,36 @@ func SchemaMigrationWorkflow(ctx workflow.Context, input types.MigrationInput) (
 	return progress, nil
 }
 
+// drainSignalChannels performs a final non-blocking drain of each channel,
+// discarding any values still buffered. Called via defer right before a
+// workflow completes so a signal that arrived too late to be acted on
+// (already past the check point that would have consumed it) doesn't get
+// flagged by the SDK as an unhandled signal.
+func drainSignalChannels(channels ...workflow.ReceiveChannel) {
+	for _, ch := range channels {
+		var discard interface{}
+		for ch.ReceiveAsync(&discard) {
+		}
+	}
+}
+
+// friendlyAlreadyAppliedMessage logs the full pgroll error detail at WARN
+// (tagged with this workflow's ID as a ref, searchable later in structured
+// logs) and returns a short presenter-facing message that omits it. A raw
+// pgroll error — a temp-file path, exact column/table name, CLI wording
+// that can change between pgroll versions — is noise to whoever's watching
+// the demo/deploy; the detail must still be investigable after the fact by
+// grepping the ref ID.
+func friendlyAlreadyAppliedMessage(ctx workflow.Context, logger log.Logger, cause error, phase string) string {
+	refID := workflow.GetInfo(ctx).WorkflowExecution.ID
+	logger.Warn("migration already applied — treating as idempotent no-op",
+		slog.String("ref_id", refID),
+		slog.String("phase", phase),
+		slog.String("detail", cause.Error()),
+	)
+	return fmt.Sprintf("This migration already appears to be applied — nothing to do. (ref: %s)", refID)
+}
+
 func triggerRollback(
 	ctx workflow.Context,
 	input types.MigrationInput,
@@ -310,9 +372,21 @@ func triggerRollback(
 				progress.PgrollStatus = decision.Status
 			}
 			if decision.Action == "skip_rollback" {
+				progress.Percent = 0
+				progress.LastUpdated = workflow.Now(ctx)
+				if cause != nil && activities.IsAlreadyAppliedError(cause) {
+					// Nothing was actually started this run (the earlier
+					// failure was pgroll rejecting a change that's already
+					// present), and reconcile confirms there's nothing
+					// in-progress to roll back either — this is the same
+					// idempotent no-op case as the validate short-circuit
+					// above, just reached via start/complete instead.
+					progress.Status = "completed"
+					progress.Message = friendlyAlreadyAppliedMessage(ctx, logger, cause, phase)
+					return progress, nil
+				}
 				progress.Status = "rolled_back"
 				progress.Message = decision.Reason
-				progress.LastUpdated = workflow.Now(ctx)
 				return progress, cause
 			}
 		} else {
@@ -347,6 +421,7 @@ func triggerRollback(
 		_ = pageOperator(ctx, progress, cause, "warning", phase)
 	}
 	progress.Status = "rolled_back"
+	progress.Percent = 0
 	progress.Message = fmt.Sprintf("rolled back after failure in phase %q", phase)
 	progress.LastUpdated = workflow.Now(ctx)
 	return progress, cause

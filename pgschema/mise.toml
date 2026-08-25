@@ -21,7 +21,7 @@ _.path = ["{{env.HOME}}/go/bin"]
 
 [tools]
 air = "latest"
-go = "1.27.0"
+go = "latest"
 overmind = "latest"
 # pgroll: zero-downtime schema migrations for PostgreSQL
 # Installed via go install so it's in GOPATH/bin

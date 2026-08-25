@@ -10,24 +10,35 @@ migration fixtures for the demo).
 No CLAUDE.md exists at repo root or under `pgschema/` — this file is the only
 agent-facing guidance here.
 
-## pgroll — roadmap gaps (status: planning backlog)
+## pgroll — roadmap (status: all originally-listed gaps implemented 2026-08-25)
 
-Current integration covers validate/start/complete/rollback/status. Gaps below are
-real backlog, not yet implemented:
+Current integration covers validate/start/complete/rollback/status, and every gap
+below is now implemented and wired into `SchemaMigrationWorkflow`
+(`internal/workflow/schema_migration.go`) and/or `BaselineWorkflow`
+(`internal/workflow/baseline.go`), not just present as standalone activities:
 
-| Gap | Why it matters | Direction |
+| Gap | Status | Where |
 |---|---|---|
-| No `pgroll init`/readiness check | First-time runs fail late if pgroll metadata is missing | Preflight activity; fail fast or gate behind `AllowInitialize` |
-| No `baseline` flow | Existing (brownfield) DBs need adoption without replaying history | Wrap `pgroll baseline`; log operator/timestamp. **Demo now exercises this at the CLI level (`mise run demo-init`) but no activity/workflow wraps it yet** |
-| No `latest schema` integration | App rollout needs the versioned schema name after `start` | Activity for `pgroll latest schema`; surface via progress query |
-| Status only checked after completion | Can't compare Temporal phase vs pgroll DB state mid-flight | Query status at each phase boundary; store last-observed in progress |
-| No operation-level risk/policy analysis | Raw SQL, renames, destructive ops all treated equally | Parse migration JSON pre-`validate`; classify risk; configurable block/approve gates |
-| No pgroll binary/version preflight | Missing/wrong binary fails only when an activity runs | `pgroll version` check at startup; compare to pinned version |
-| No reconciliation/idempotency vs pgroll state | Crash/retry can diverge Temporal state from DB state | Read pgroll status before each mutating step; no-op/continue/rollback/fail accordingly |
+| `pgroll init`/readiness check | **Done** | `PgrollActivities.CheckPgrollReadiness`/`defaultReadiness` (`internal/activities/pgroll.go`) — probes status, auto-runs `pgroll init` when `AllowInitialize` is set, else fails fast with a clear message. Called at workflow start. |
+| `baseline` flow | **Done** | `PgrollActivities.CreateBaseline`/`defaultBaseline` wraps `pgroll baseline <version> <dir> --yes`, records operator/timestamp/status (`already_baselined` vs `created`); orchestrated end-to-end by `BaselineWorkflow` (version+readiness preflight, then baseline), queryable via `baseline-status`. |
+| `latest schema` integration | **Done** | `PgrollActivities.GetLatestSchema`/`defaultLatestSchema` runs `pgroll latest schema`; called after `start` and surfaced as `progress.LatestSchema` on the `migration-progress` query. |
+| Status checked only after completion | **Done** | `ReconcileMigrationState` is called at `before_start`, `before_complete`, and `before_rollback` phase boundaries (plus best-effort status refreshes throughout); `progress.ReconciliationAction`/`progress.PgrollStatus` expose the last-observed state. |
+| Operation-level risk/policy analysis | **Done** | `PgrollActivities.AnalyzeMigrationRisk`/`analyzeMigrationRisk` parses the migration JSON pre-`validate`, classifies each operation (raw SQL, renames, destructive ops, defaults/backfills, protected schema/table), and enforces `types.MigrationPolicy` block/require-approval gates — a blocked or unapproved migration fails the workflow with a non-retryable error before `validate` runs. |
+| pgroll binary/version preflight | **Done** | `PgrollActivities.CheckPgrollVersion`/`defaultVersion` runs `pgroll version` (falls back to `--version`), compares against `ExpectedPgrollVersion` (default `v0.16.2`), warns or hard-fails per `RequireExactPgrollVersion`. Called first in both workflows. |
+| Reconciliation/idempotency vs pgroll state | **Done** | `ReconcileMigrationState`/`defaultReconcile` reads live pgroll status+version before each mutating step and returns `continue`/`resume_wait`/`already_complete`/`skip_complete`/`skip_rollback`/`fail`; the workflow branches on the action instead of blindly re-running `start`/`complete`/`rollback` on retry. |
+
+All of the above is gated behind `workflow.GetVersion(ctx, "pgroll-roadmap", ...)`
+in `schema_migration.go` (`roadmapEnabled`) for replay-safety against
+already-running workflow histories — new executions get the full roadmap path,
+in-flight ones from before this change keep their original (non-versioned)
+behavior until they complete.
 
 Notes: keep pgroll activities small/explicit; do all pgroll CLI/DB inspection in
 activities, never in workflow code (determinism); treat `init`/`baseline` as
 onboarding ops, not normal migration steps.
+
+No further pgroll roadmap items are tracked here — new gaps should be added as a
+fresh table/section rather than reopening the rows above.
 
 ## pgstream — roadmap gaps (status: planning backlog)
 
@@ -105,6 +116,82 @@ or row-level data; replication slots left abandoned retain WAL on the source.
   structure for an agent/`jq` to reconstruct a run's timeline from logs alone.
   Gaps: no downstream log-query consumer exists yet; `trace_id` is per-operation,
   not per-workflow-run (no single ID threads one workflow execution end-to-end).
+- **Double-run / already-applied migration** (`internal/activities/base.go`,
+  `internal/activities/pgroll.go`, `internal/workflow/schema_migration.go`):
+  re-running an already-completed scenario (double click, or re-clicking
+  "Run" after it finished) used to fail. Two distinct shapes were found —
+  fixed in two passes, worth knowing both happened:
+  1. *Add/create ops* (`column "email" already exists`): the workflow tried
+     to compensate via `pgroll rollback`, which *also* errored (`unable to
+     get active migration: no active migration`) since nothing was actually
+     started — paging the operator at "critical" and leaving the workflow
+     `rollback_failed`. First fix: `IsAlreadyAppliedError`/
+     `IsNoActiveMigrationError` classify pgroll's CLI error text (see the SDK
+     section above for why this is text-matched at all), and
+     `before_rollback` only attempts a real rollback when status is
+     genuinely `"in progress"`.
+  2. *Rename/drop ops* (`column "full_name" does not exist on table
+     "users"` — the same double-run, but the FLIP side: the old name is
+     gone because the first run already renamed it away): text-matching
+     `"already exists"` doesn't catch this, and broadening to also match
+     `"does not exist"` would be actively wrong — that same error text is
+     also what a genuinely different, broken migration produces (e.g.
+     clicking a later demo scenario before its prerequisite ran; see
+     Troubleshooting in `demo/README.md`), and swallowing THAT as "already
+     applied, nothing to do" would silently hide a real failure while
+     reporting success.
+
+  The real fix for (2), which also subsumes (1) as its primary path now:
+  make pgroll's own tracked migration name **content-addressable** instead
+  of random. `runPgroll` (`base.go`) used to write the migration JSON to
+  `os.CreateTemp("", "pgroll-migration-*.json")` — a random suffix, because
+  pgroll v0.16.2 rejects an explicit top-level `"name"` field in the
+  document itself and instead derives a migration's tracked name from the
+  temp file's basename. `MigrationFileName(migrationJSON)` (`base.go`) hashes
+  the content instead (`sha256`, truncated), written into a fresh
+  `os.MkdirTemp` dir each call (unique path per invocation, so two truly
+  concurrent runs of identical content can't race on the same file — the
+  directory doesn't affect the name pgroll derives, only the basename does).
+  `migrationIdentity` (`pgroll.go`) recomputes the same hash from
+  `MigrationInput.MigrationJSON` to compare against pgroll's reported
+  current version in `reconcileDecision` — this is what `matchesCurrent` was
+  *originally* meant to do; it just never worked because nothing produced a
+  real, comparable name before. `SchemaMigrationWorkflow` now checks
+  `reconcile("before_start")` **before** `ValidateMigration` (previously
+  validate always ran first) — pgroll reporting `"Complete"` with a matching
+  content hash is a reliable "this exact migration already fully applied"
+  signal, so a double-run short-circuits to `completed` before validate gets
+  a chance to fail on either shape of already-changed schema, for any
+  operation type — no error-text matching needed for the primary path
+  anymore. A DIFFERENT migration against the same `"Complete"` status
+  doesn't match and falls through to validate normally, so it still fails
+  for real (verified — see tests below). `IsAlreadyAppliedError` stays as a
+  defense-in-depth fallback inside the `shouldStart` branch (fires only if
+  reconcile itself errored, or on a pre-roadmap replay where reconcile is
+  skipped entirely) — `ValidateMigration`/`StartMigration` still return a
+  non-retryable error for that shape so it fails fast instead of burning the
+  5-attempt/~30s backoff.
+
+  `reconcileDecision` stayed split out as a pure function for unit testing
+  without a live pgroll/DB — see `TestReconcileDecision_*` and
+  `TestMigrationIdentity_DeterministicAndDistinct` in
+  `internal/activities/pgroll_test.go`. Real-binary end-to-end coverage in
+  `test/integration/pgroll_double_run_test.go` (build tag `integration`,
+  testcontainers Postgres): `..._RunTwice_SecondRunIsIdempotent` (add-column
+  shape), `..._RunTwice_RenameIsAlsoIdempotent` (rename shape),
+  `..._DifferentMigrationAfterComplete_StillFails` (the false-positive
+  guard — a distinct, invalid migration against a `"Complete"` schema must
+  still fail, not be swallowed).
+- **No raw pgroll detail in presenter-facing messages**: the friendly-skip
+  paths above (`friendlyAlreadyAppliedMessage` in `schema_migration.go`) log
+  the full pgroll error text at `WARN` tagged `ref_id=<workflowID>` and return
+  only `"...nothing to do. (ref: <workflowID>)"` to `progress.Message` — the
+  workflow ID doubles as the searchable ref since the demo UI already
+  displays it. Don't reintroduce `err.Error()`/`cause.Error()` directly into
+  `progress.Message` for these paths; grep `ref_id=<id>` in worker logs
+  instead. Covered by
+  `TestValidationFailure_AlreadyApplied_FriendlyMessage`
+  (`internal/workflow/schema_migration_test.go`).
 
 ## Real pgroll v0.16.2 CLI bugs found + fixed (discovered by running it, not by docs)
 
@@ -139,6 +226,74 @@ Validated end-to-end for real: all 6 demo migrations run start→complete agains
 live Postgres 18 (see `demo/`), plus the exact `PgrollActivities` code path
 (`ValidateMigration`→`StartMigration`→`GetMigrationStatus`→`CompleteMigration`)
 exercised directly against a live DB in a throwaway test.
+
+## pgroll has a real Go SDK — CLI shelling is not the only option (found 2026-08-25)
+
+`internal/activities/pgroll.go` drives pgroll entirely via `exec.Command` +
+temp files (`runPgroll` in `base.go`), then classifies failures by
+`strings.Contains(strings.ToLower(err.Error()), ...)` against CLI
+stdout/stderr text (`IsAlreadyAppliedError`, `IsNoActiveMigrationError`, both
+in `pgroll.go`). That works but is inherently flaky: CLI wording can change
+across pgroll releases, gets ANSI-color-coded in a real terminal, and ANY
+matching detail (a temp-file path, an internal error format) has to be
+scraped from a flat string.
+
+Investigated whether pgroll exposes a library API instead. It does — the
+same module installed via `go install github.com/xataio/pgroll@v0.16.2` has
+a full in-process Go SDK under `pkg/`, Apache-2.0, Go 1.26.3 module (matches
+this repo's toolchain), no CGO observed:
+
+```go
+pkg/roll/roll.go:      func New(ctx, pgURL, schema string, state *state.State, opts ...Option) (*Roll, error)
+pkg/roll/roll.go:      func (m *Roll) Init(ctx) error
+pkg/roll/baseline.go:  func (m *Roll) CreateBaseline(ctx, baselineVersion string) error
+pkg/roll/execute.go:   func (m *Roll) Validate(ctx, migration *migrations.Migration) error
+pkg/roll/execute.go:   func (m *Roll) Start(ctx, migration *migrations.Migration, cfg *backfill.Config) error
+pkg/roll/execute.go:   func (m *Roll) Complete(ctx) error
+pkg/roll/execute.go:   func (m *Roll) Rollback(ctx) error
+pkg/roll/status.go:    func (m *Roll) Status(ctx, schema string) (*Status, error)
+```
+
+Calling these directly instead of shelling out would replace string-matching
+with real typed errors:
+
+- `pkg/migrations/errors.go` exports structured, `errors.As`-able types per
+  failure kind: `TableAlreadyExistsError{Name}`, `ColumnAlreadyExistsError{Table,Name}`,
+  `IndexAlreadyExistsError{Name}` (and the inverse `*DoesNotExistError`
+  family) — exactly the "already applied" class this codebase currently
+  detects by substring.
+- `pkg/state/errors.go` exports `var ErrNoActiveMigration = errors.New("no
+  active migration")` as an `errors.Is`-able sentinel. `Roll.Rollback()`
+  (`pkg/roll/execute.go:258`) wraps it with `%w` all the way up
+  (`state.GetActiveMigration` returns it on `sql.ErrNoRows`, `Rollback`
+  wraps as `fmt.Errorf("unable to get active migration: %w", err)`) —
+  exactly the "no active migration" class this codebase also currently
+  detects by substring.
+
+**Why the CLI path can never get this**: `exec.Command` + stdout/stderr
+necessarily discards Go type information — cobra's error printing just
+calls `.Error()`. String-matching is the only option *while shelling out*;
+it is not a shortcut that could be tightened later without the switch below.
+
+**Cost of switching — nontrivial, own refactor, not a small patch**:
+`pkg/roll.New` needs a `*state.State` (its own constructor + connection
+setup, separate from `Roll`), and `Roll.Validate`/`.Start` take a typed
+`*migrations.Migration`, not a JSON string — so this project's
+`MigrationJSON string` field on `types.MigrationInput` and the whole
+exec/temp-file plumbing in `activities/base.go` (`runPgroll`,
+`runPgrollOutput`, `runCommand`'s pgroll-specific callers) would need
+replacing with library calls, with our JSON unmarshaled into
+`migrations.Migration` instead of written to a file. `PgrollActivities`'
+`ValidateFn`/`StartFn`/etc. func-field pattern for test injection would
+still work, just wrapping library calls instead of CLI calls, and
+`IsAlreadyAppliedError`/`IsNoActiveMigrationError` would become `errors.As`/
+`errors.Is` checks against the real pgroll error types instead of substring
+matches — the same call sites (`internal/workflow/schema_migration.go`'s
+validate short-circuit and `triggerRollback`'s before_rollback skip) stay,
+just with a more precise/robust classification underneath.
+
+Not attempted yet — flagged for a future dedicated pass, not bundled into
+the double-run fix below.
 
 ## Local dev loop (`mise.toml`, `.air*.toml`, `Procfile`)
 

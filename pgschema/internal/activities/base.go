@@ -10,10 +10,12 @@ package activities
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -215,30 +217,55 @@ func redactArgs(args []string) []string {
 // written to a temp file and passed as the trailing positional <file>
 // argument that `validate`/`start` require (pgroll v0.16.2 does not accept
 // the migration on stdin — confirmed against the real binary; see
-// AGENT.md). The flag is `--postgres-url`, not `--dsn` — also confirmed
+// AGENTS.md). The flag is `--postgres-url`, not `--dsn` — also confirmed
 // against `pgroll --help`, since v0.16.2 renamed/never had a `--dsn` flag.
 // Shared by PgrollActivities and PreviewDBActivities (migration preview).
+//
+// The file's basename (minus extension) matters beyond being an argument:
+// pgroll v0.16.2 rejects a top-level "name" field in the migration document
+// itself ("unknown field \"name\""), so it derives the migration's tracked
+// version/name from this filename. MigrationFileName below makes that name
+// content-addressable (a hash of migrationJSON, not the random suffix
+// os.CreateTemp would give it) — see AGENTS.md's "double-run" section for
+// why: it lets reconcileDecision compare pgroll's reported current version
+// against a name this package can independently recompute from the same
+// migration input, instead of guessing from CLI error text.
 func (b baseActivities) runPgroll(ctx context.Context, dsn, schema string, args []string, migrationJSON string) error {
 	full := append([]string{"--postgres-url", dsn, "--schema", schema}, args...)
 
 	if migrationJSON != "" {
-		f, err := os.CreateTemp("", "pgroll-migration-*.json")
+		// A per-invocation-unique directory (not just a deterministic
+		// filename) avoids two concurrent runs of the identical migration
+		// content — a genuine double-click race, not just a sequential
+		// re-run — from writing/removing the same path out from under each
+		// other; pgroll's derived name only depends on the basename, not
+		// the directory, so this doesn't affect the content-addressing.
+		dir, err := os.MkdirTemp("", "pgroll-migration-*")
 		if err != nil {
+			return fmt.Errorf("create migration temp dir: %w", err)
+		}
+		defer os.RemoveAll(dir)
+
+		path := filepath.Join(dir, MigrationFileName(migrationJSON))
+		if err := os.WriteFile(path, []byte(migrationJSON), 0o600); err != nil {
 			return fmt.Errorf("write migration file: %w", err)
 		}
-		defer os.Remove(f.Name())
-		if _, err := f.WriteString(migrationJSON); err != nil {
-			f.Close()
-			return fmt.Errorf("write migration file: %w", err)
-		}
-		if err := f.Close(); err != nil {
-			return fmt.Errorf("write migration file: %w", err)
-		}
-		full = append(full, f.Name())
+		full = append(full, path)
 	}
 
 	_, err := b.runCommand(ctx, "pgroll", full)
 	return err
+}
+
+// MigrationFileName returns the deterministic filename (basename only, incl.
+// ".json") pgroll will derive this migration's tracked version/name from —
+// see the runPgroll doc comment. Exported so activity code that needs to
+// know pgroll's name for a given migration ahead of time (defaultReconcile,
+// currently) can recompute it independently rather than re-deriving it from
+// a file on disk.
+func MigrationFileName(migrationJSON string) string {
+	sum := sha256.Sum256([]byte(migrationJSON))
+	return fmt.Sprintf("pgroll-migration-%x.json", sum[:8])
 }
 
 // runPgrollOutput invokes pgroll and returns stdout only, for subcommands

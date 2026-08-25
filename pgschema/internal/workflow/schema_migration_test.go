@@ -189,6 +189,37 @@ func (s *SchemaMigrationTestSuite) TestValidationFailure() {
 	s.Contains(err.Error(), "validate", "error must identify the failing phase")
 }
 
+// ── ValidationFailure_AlreadyApplied ─────────────────────────────────────────
+//
+// Re-running an already-completed scenario (double click, or re-clicking
+// "Run" after it finished) makes pgroll validate fail with a message like
+// `column "email" already exists in table "users"` — a real pgroll detail,
+// including internal temp-file paths. The workflow must not surface that
+// raw detail to whoever's watching (the demo/deploy UI); it should report a
+// short, friendly message tagged with this workflow's ID as a ref, with the
+// full detail only in structured logs (searchable by that same ref ID).
+
+func (s *SchemaMigrationTestSuite) TestValidationFailure_AlreadyApplied_FriendlyMessage() {
+	rawDetail := `migration 'add_email' is invalid: column "email" already exists in table "users"`
+	fake := newFakeMigration(func(f *fakeMigration) {
+		f.pgroll.ValidateFn = func(_ context.Context, _ types.MigrationInput) error {
+			return errors.New(rawDetail)
+		}
+	})
+	fake.register(s.env)
+
+	s.env.ExecuteWorkflow(SchemaMigrationWorkflow, defaultInput())
+	s.True(s.env.IsWorkflowCompleted())
+	s.NoError(s.env.GetWorkflowError(), "an already-applied migration must not surface as a workflow failure")
+
+	var result types.ProgressResponse
+	s.NoError(s.env.GetWorkflowResult(&result))
+	s.Equal("completed", result.Status)
+	s.Contains(result.Message, "ref:", "message must carry a ref ID for later log lookup")
+	s.NotContains(result.Message, "already exists", "raw pgroll detail must not reach the presenter-facing message")
+	s.NotContains(result.Message, rawDetail, "raw pgroll detail must not reach the presenter-facing message")
+}
+
 // ── StartFailure ──────────────────────────────────────────────────────────────
 
 func (s *SchemaMigrationTestSuite) TestStartMigrationFailure() {
@@ -255,6 +286,38 @@ func (s *SchemaMigrationTestSuite) TestRollbackSignal_AfterStart() {
 	var result types.ProgressResponse
 	_ = s.env.GetWorkflowResult(&result)
 	s.Equal("rolled_back", result.Status)
+}
+
+// TestRollbackSignal_ArrivesAfterCompletion is the regression test for the
+// "Workflow has unhandled signals [rollback]" warning seen in worker logs:
+// an operator's rollback signal can arrive after the workflow has already
+// passed every checkpoint that consumes rollbackCh (e.g. once app-ready has
+// been received and CompleteMigration has already succeeded). The workflow
+// must still complete cleanly — draining the stale signal rather than
+// leaving it unhandled — instead of rolling back a migration that already
+// finished.
+func (s *SchemaMigrationTestSuite) TestRollbackSignal_ArrivesAfterCompletion() {
+	fake := newFakeMigration()
+	fake.register(s.env)
+
+	s.env.RegisterDelayedCallback(func() {
+		s.env.SignalWorkflow(SignalAppReady, nil)
+	}, 1*time.Millisecond)
+
+	// Fired after the workflow has already completed in test-env terms;
+	// TestWorkflowEnvironment still delivers it into the buffered channel,
+	// exercising the same "stale signal sitting unread" scenario as prod.
+	s.env.RegisterDelayedCallback(func() {
+		s.env.SignalWorkflow(SignalRollback, nil)
+	}, 2*time.Millisecond)
+
+	s.env.ExecuteWorkflow(SchemaMigrationWorkflow, defaultInput())
+	s.True(s.env.IsWorkflowCompleted())
+	s.NoError(s.env.GetWorkflowError())
+
+	var result types.ProgressResponse
+	s.NoError(s.env.GetWorkflowResult(&result))
+	s.Equal("completed", result.Status, "a rollback signal arriving after completion must not be treated as a live rollback request")
 }
 
 // ── CompleteFailure ───────────────────────────────────────────────────────────
