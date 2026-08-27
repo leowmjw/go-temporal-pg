@@ -23,10 +23,52 @@ func TestIndexRenders(t *testing.T) {
 		t.Fatalf("status = %d", rec.Code)
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"1. Add nullable column", "6. PG18 bonus", "@post('/scenario/5b/start')", "datastar@v1.0.2"} {
+	for _, want := range []string{"1. Add nullable column", "6. PG18 bonus", `href="/scenario/5b"`, "datastar@v1.0.2"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("index missing %q", want)
 		}
+	}
+}
+
+func TestScenarioPageRenders(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/scenario/1", nil)
+	req.SetPathValue("id", "1")
+	s := &server{migrationsDir: "../../demo/migrations"}
+	s.handleScenarioPage(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"1. Add nullable column", "@post('/scenario/1/start')", `id="plan-panel"`, `id="version-panel"`, "diff-line add", `href="/scenario/2"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("scenario page missing %q", want)
+		}
+	}
+}
+
+func TestScenarioPageLastHasNoNextLink(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/scenario/6", nil)
+	req.SetPathValue("id", "6")
+	s := &server{migrationsDir: "../../demo/migrations"}
+	s.handleScenarioPage(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "next:") {
+		t.Errorf("last scenario page should have no next-scenario link")
+	}
+}
+
+func TestScenarioPageUnknownID(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/scenario/nope", nil)
+	req.SetPathValue("id", "nope")
+	s := &server{migrationsDir: "../../demo/migrations"}
+	s.handleScenarioPage(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
 	}
 }
 

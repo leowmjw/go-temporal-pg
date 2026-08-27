@@ -40,6 +40,9 @@ tmp/
 # Ignore mise config
 mise.local.toml
 
-# Ignore binaries
-pgschema-demo
+# Ignore binaries (path-scoped: an unscoped "pgschema-demo" pattern also
+# matches the cmd/pgschema-demo/ *source* directory, since the built binary
+# shares its name with the package dir — that silently hid new .go files
+# from git status/add)
+pgschema/cmd/pgschema-demo/pgschema-demo
 

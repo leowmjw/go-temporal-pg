@@ -359,7 +359,82 @@ scenario click and streams `migration-progress` + phase transitions back over
 SSE, with buttons for the real `app-ready`/`rollback` signals. Only imports
 `internal/workflow`/`internal/types` — no activity/workflow logic duplicated.
 SSE wire-format exactness is pinned by `TestSSEWireFormat`
-(`cmd/pgschema-demo/main_test.go`); template rendering by `TestIndexRenders`.
+(`cmd/pgschema-demo/main_test.go`); template rendering by `TestIndexRenders`,
+`TestScenarioPageRenders`, `TestScenarioPageLastHasNoNextLink`,
+`TestScenarioPageUnknownID`.
+
+### Demo UX overhaul (2026-08-25/26): per-scenario pages + live version panel
+
+The demo used to be one page: a scenario list, a shared "live workflow state"
+box, and an activity log. It's now two page types, still zero-build-step
+Datastar + `html/template`:
+
+- **`template.go`**: `commonCSS` (shared, compile-time-concatenated Go string
+  const) + `landingHTML` (`/` — just scenario cards linking out, plus the
+  reset button) + `scenarioHTML` (`/scenario/{id}` — plan panel on top,
+  Activity Log bottom-left, Live Workflow State bottom-right, a custom
+  `div`-based progress bar + step-dot row instead of `<progress>`, a
+  `data-show` CSS spinner during preflight/validate). Each scenario page also
+  links to `/` (back) and, via `nextScenario(id)` in `main.go`, to the next
+  scenario in the `scenarios` slice (omitted on the last one) — presenter
+  convenience for stepping through 1→2→3→…→6 without returning to the
+  landing page each time.
+- **`plan.go`** (new): parses the scenario's pgroll migration JSON into
+  `renderPlanDiff` (+/- lines, scoped to the op shapes this demo's 7 files
+  actually use: `add_column`, `rename_column`, `alter_column`/unique) and
+  `renderPlanGraph` (op nodes in a flow, highlight driven purely by
+  `data-class` against `$phase`/`$percent` — no server re-render needed as
+  the run progresses, since the plan itself never changes mid-run).
+- **`versions.go`** (new) + a **key finding**: pgroll's expand/contract model
+  is real, queryable Postgres state, not something the demo needs to
+  simulate. Each version lives as an actual schema named
+  `<schema>_<version>` (`progress.LatestSchema` was already one of these);
+  old and new coexist during expand, `complete` drops the old one, `rollback`
+  drops the new one. So the whole "old vs. new schema, side by side,
+  selectable, greys out once cleaned up" panel is driven by plain
+  `information_schema.schemata`/`.columns` queries via short-lived
+  `pgx.Connect` calls (same pattern `resetDatabase` already used) — **no new
+  Temporal activities/queries were added**, and `internal/workflow`/
+  `internal/activities`/`internal/types` are untouched by this whole pass.
+  `run.SeenVersions` (union of every versioned schema ever observed live)
+  vs. a fresh `listVersionedSchemas` result is what distinguishes "greyed
+  out, cleaned up" from "currently live" — not any client-side/optimistic
+  state. `streamProgress`'s existing 700ms ticker also refreshes the version
+  panel each tick (`gatherVersionSnapshot` + `patchElements(..., "outer",
+  ...)`) once `percent >= 5`, rather than opening a second SSE stream.
+  Backfill scenarios (2, 5, 6 — `scenario.BackfillColumn`) get a concrete
+  before/after row-coverage line from the same snapshot.
+  "Switching" a version via `POST /versions/{schema}/activate` only changes
+  which schema the panel *previews* (read-only) — committing/aborting the
+  real migration is still exactly the pre-existing `app-ready`/`rollback`
+  signals; the two are intentionally not conflated.
+
+**Gotcha hit while verifying this pass — read before assuming "it's not
+working"**: `.gitignore` had a bare `pgschema-demo` line meant to ignore the
+built binary. Because the built binary and the *source directory*
+(`cmd/pgschema-demo/`) share the same name, that pattern also matched the
+directory and silently hid new files under it from `git status`/`git add`
+(existing tracked files like `main.go` still showed as modified — only
+newly-created files like `plan.go`/`versions.go` vanished). Fixed by scoping
+the pattern to the actual binary path
+(`pgschema/cmd/pgschema-demo/pgschema-demo`). If a new file in this directory
+isn't showing up in `git status`, check `git check-ignore -v <path>` before
+assuming you forgot to create it.
+
+**Gotcha hit while verifying this pass, #2 — stale orphaned dev server**:
+after editing demo source under an already-running `mise run dev`
+(`air`-supervised), the browser kept showing old behavior even though the
+binary rebuilt successfully. Cause: an *orphaned* `pgschema-demo-dev`
+process from an earlier, already-exited `overmind`/`air` session (`ps -o
+ppid` showed `1`, i.e. reparented to launchd) was still bound to `:8090` and
+serving stale code; the current session's freshly-built process couldn't
+bind the port at all. Diagnosis: `lsof -i :8090` for the PID, then `ps -o
+pid,ppid,command -p <pid>` — a demo server whose parent isn't the current
+`air`/`overmind` tree is the tell. Fix was just `kill <stale-pid>`; the
+live session's process (or a user-initiated `mise run dev` restart) then
+bound the now-free port immediately. Worth checking this first any time "the
+UI still shows old behavior after a rebuild" during this kind of live dev-loop
+debugging session.
 
 ## Misc
 

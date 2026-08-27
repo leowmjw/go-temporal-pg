@@ -44,6 +44,11 @@ type scenario struct {
 	Title       string
 	Description string
 	File        string
+	// BackfillColumn is the column pgroll backfills into existing rows
+	// during expand, if any. Empty for scenarios that don't backfill
+	// (pure add-nullable, rename, or constraint-only migrations) — the
+	// version panel only renders a before/after backfill line when set.
+	BackfillColumn string
 }
 
 var scenarios = []scenario{
@@ -54,10 +59,11 @@ var scenarios = []scenario{
 		File:        "01_add_email.json",
 	},
 	{
-		ID:          "2",
-		Title:       "2. Add NOT NULL column + backfill",
-		Description: "Add users.status NOT NULL DEFAULT 'active', with pgroll backfilling existing rows during the expand phase.",
-		File:        "02_add_status_backfill.json",
+		ID:             "2",
+		Title:          "2. Add NOT NULL column + backfill",
+		Description:    "Add users.status NOT NULL DEFAULT 'active', with pgroll backfilling existing rows during the expand phase.",
+		File:           "02_add_status_backfill.json",
+		BackfillColumn: "status",
 	},
 	{
 		ID:          "3",
@@ -72,10 +78,11 @@ var scenarios = []scenario{
 		File:        "04_add_unique_email.json",
 	},
 	{
-		ID:          "5",
-		Title:       "5. Multi-op raw-SQL data migration",
-		Description: "Split users.display_name into first_name/last_name with two backfilled add_column ops in one migration.",
-		File:        "05_split_display_name.json",
+		ID:             "5",
+		Title:          "5. Multi-op raw-SQL data migration",
+		Description:    "Split users.display_name into first_name/last_name with two backfilled add_column ops in one migration.",
+		File:           "05_split_display_name.json",
+		BackfillColumn: "first_name",
 	},
 	{
 		ID:          "5b",
@@ -84,10 +91,11 @@ var scenarios = []scenario{
 		File:        "06_rollback_demo_phone.json",
 	},
 	{
-		ID:          "6",
-		Title:       "6. PG18 bonus: sortable external ID",
-		Description: "Add users.external_id UUID NOT NULL DEFAULT uuidv7() — Postgres 18's new builtin sortable UUID generator, backfilled with no extension required.",
-		File:        "07_pg18_uuidv7_external_id.json",
+		ID:             "6",
+		Title:          "6. PG18 bonus: sortable external ID",
+		Description:    "Add users.external_id UUID NOT NULL DEFAULT uuidv7() — Postgres 18's new builtin sortable UUID generator, backfilled with no extension required.",
+		File:           "07_pg18_uuidv7_external_id.json",
+		BackfillColumn: "external_id",
 	},
 }
 
@@ -100,6 +108,18 @@ func scenarioByID(id string) (scenario, bool) {
 	return scenario{}, false
 }
 
+// nextScenario returns the scenario listed right after id (basic → complex
+// order), or nil if id is the last one — used for the "Next scenario →" link
+// on the scenario page.
+func nextScenario(id string) *scenario {
+	for i, s := range scenarios {
+		if s.ID == id && i+1 < len(scenarios) {
+			return &scenarios[i+1]
+		}
+	}
+	return nil
+}
+
 // run tracks the single in-flight demo workflow. A demo is presenter-driven
 // and single-operator, so one global run (guarded by mu) is intentionally
 // simpler than per-session state.
@@ -108,6 +128,18 @@ type run struct {
 	RunID      string
 	Scenario   scenario
 	StartedAt  time.Time
+
+	// ActiveVersionSchema is which versioned schema (e.g.
+	// "public_02_add_status_backfill") the version panel currently treats
+	// as "active" — a read-only preview pointer, not a real app deploy.
+	// Defaults to the newest live version once one exists.
+	ActiveVersionSchema string
+	// SeenVersions is the union of every versioned schema ever observed
+	// live for this run. A schema present here but absent from a fresh
+	// listVersionedSchemas call has been physically dropped by pgroll
+	// (complete drops the old one, rollback drops the new one) and
+	// renders greyed out.
+	SeenVersions map[string]bool
 }
 
 type server struct {
@@ -153,10 +185,12 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", srv.handleIndex)
+	mux.HandleFunc("GET /scenario/{id}", srv.handleScenarioPage)
 	mux.HandleFunc("GET /status", srv.handleStatus)
 	mux.HandleFunc("POST /scenario/{id}/start", srv.handleStartScenario)
 	mux.HandleFunc("POST /signal/app-ready", srv.handleSignal(workflow.SignalAppReady, "app-ready"))
 	mux.HandleFunc("POST /signal/rollback", srv.handleSignal(workflow.SignalRollback, "rollback"))
+	mux.HandleFunc("POST /versions/{schema}/activate", srv.handleActivateVersion)
 	mux.HandleFunc("POST /reset", srv.handleReset)
 
 	log.Info("pgschema demo web UI listening", slog.String("addr", *addr), slog.String("dsn", activities.RedactDSN(*dsn)))
@@ -173,15 +207,46 @@ func envOr(key, def string) string {
 	return def
 }
 
+// ─── Pages ──────────────────────────────────────────────────────────────────
 
-// ─── Page ───────────────────────────────────────────────────────────────────
-
-var indexTmpl = template.Must(template.New("index").Parse(indexHTML))
+var landingTmpl = template.Must(template.New("landing").Parse(landingHTML))
+var scenarioTmpl = template.Must(template.New("scenario").Parse(scenarioHTML))
 
 func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := indexTmpl.Execute(w, struct{ Scenarios []scenario }{scenarios}); err != nil {
-		s.log.Error("render index", slog.String("error", err.Error()))
+	if err := landingTmpl.Execute(w, struct{ Scenarios []scenario }{scenarios}); err != nil {
+		s.log.Error("render landing page", slog.String("error", err.Error()))
+	}
+}
+
+func (s *server) handleScenarioPage(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	sc, ok := scenarioByID(id)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	migrationJSON, err := os.ReadFile(filepath.Join(s.migrationsDir, sc.File))
+	if err != nil {
+		http.Error(w, "failed to read migration file: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	ops, err := parseMigrationPlan(string(migrationJSON))
+	if err != nil {
+		http.Error(w, "failed to parse migration plan: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	data := struct {
+		Scenario  scenario
+		Next      *scenario
+		PlanDiff  template.HTML
+		PlanGraph template.HTML
+	}{Scenario: sc, Next: nextScenario(sc.ID), PlanDiff: renderPlanDiff(ops), PlanGraph: renderPlanGraph(ops)}
+	if err := scenarioTmpl.Execute(w, data); err != nil {
+		s.log.Error("render scenario page", slog.String("error", err.Error()))
 	}
 }
 
@@ -250,7 +315,7 @@ func (s *server) handleStartScenario(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cur := &run{WorkflowID: workflowID, RunID: wr.GetRunID(), Scenario: sc, StartedAt: time.Now()}
+	cur := &run{WorkflowID: workflowID, RunID: wr.GetRunID(), Scenario: sc, StartedAt: time.Now(), SeenVersions: map[string]bool{}}
 	s.mu.Lock()
 	s.current = cur
 	s.mu.Unlock()
@@ -294,6 +359,12 @@ func (s *server) streamProgress(ctx context.Context, w http.ResponseWriter, f ht
 				patchElements(w, f, "#log-lines", "append", logLine(fmt.Sprintf("[%s] phase → %s", cur.WorkflowID, progress.Phase)))
 			}
 			_ = patchSignals(w, f, progressSignals(cur, progress))
+
+			if progress.Percent >= 5 {
+				if snap, err := gatherVersionSnapshot(ctx, s.dsn, s.schema, cur); err == nil {
+					patchElements(w, f, "#version-panel", "outer", renderVersionPanelString(cur, snap))
+				}
+			}
 
 			if isTerminal(progress.Status) {
 				patchElements(w, f, "#log-lines", "append", logLine(fmt.Sprintf("[%s] finished: %s", cur.WorkflowID, progress.Status)))
@@ -367,6 +438,52 @@ func (s *server) handleSignal(signalName, label string) http.HandlerFunc {
 		}
 		patchElements(w, f, "#log-lines", "append", logLine(fmt.Sprintf("[%s] sent %q signal", cur.WorkflowID, label)))
 	}
+}
+
+// ─── Version preview (cosmetic — see versions.go) ─────────────────────────
+
+// handleActivateVersion sets which versioned schema the version panel
+// treats as "active" for preview purposes. It never touches the workflow or
+// the real app — the actual commit/abort of the migration is still done via
+// the app-ready/rollback signals above.
+func (s *server) handleActivateVersion(w http.ResponseWriter, r *http.Request) {
+	schemaName := r.PathValue("schema")
+	f := sseHeaders(w)
+
+	s.mu.Lock()
+	cur := s.current
+	s.mu.Unlock()
+
+	if cur == nil {
+		patchElements(w, f, "#log-lines", "append", logLine("no active run to preview a version for"))
+		return
+	}
+
+	live, err := listVersionedSchemas(r.Context(), s.dsn, s.schema)
+	if err != nil {
+		patchElements(w, f, "#log-lines", "append", logLine("failed to list live versions: "+err.Error()))
+		return
+	}
+	found := false
+	for _, v := range live {
+		if v == schemaName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		patchElements(w, f, "#log-lines", "append", logLine(fmt.Sprintf("version %q is no longer live — can't preview it", schemaName)))
+		return
+	}
+
+	cur.ActiveVersionSchema = schemaName
+	patchElements(w, f, "#log-lines", "append", logLine(fmt.Sprintf("[%s] simulated app switch to reading via schema %s", cur.WorkflowID, schemaName)))
+
+	snap, err := gatherVersionSnapshot(r.Context(), s.dsn, s.schema, cur)
+	if err != nil {
+		return
+	}
+	patchElements(w, f, "#version-panel", "outer", renderVersionPanelString(cur, snap))
 }
 
 // ─── Reset (recover from a stuck/bad demo state) ──────────────────────────
